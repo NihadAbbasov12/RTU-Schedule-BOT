@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from calendar import monthrange
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest
@@ -25,8 +26,10 @@ from aiogram.types import (
 
 from config import Settings
 from formatter import (
+    format_admin_stats,
     format_changes,
     format_daily_schedule,
+    format_reminder,
     format_range_schedule,
     format_status,
     format_subjects,
@@ -60,10 +63,12 @@ BUTTON_SUBJECTS = "Subjects"
 BUTTON_REFRESH = "Refresh"
 BUTTON_STATUS = "Status"
 BUTTON_CHANGE_SELECTION = "Change selection"
+BUTTON_STATS = "Stats"
 
 CALLBACK_PREFIX = "cfg"
 WEEKEND_MESSAGE = "That was the last lesson for this week. Have a great weekend!"
 SELECTION_TITLE = "RTU Schedule Setup"
+SCHEDULE_REQUEST_ACTIONS = {"today", "tomorrow", "week", "month", "subjects", "refresh", "status"}
 
 PROGRAM_PAGE_SIZE = 8
 SMALL_PAGE_SIZE = 8
@@ -228,7 +233,7 @@ class ScheduleBotApp:
                 await self._send_text(
                     selection.chat_id,
                     WEEKEND_MESSAGE,
-                    reply_markup=self._main_menu(),
+                    reply_markup=self._main_menu(selection.chat_id),
                 )
                 await asyncio.to_thread(
                     self.storage.mark_weekend_notification_sent,
@@ -244,6 +249,111 @@ class ScheduleBotApp:
                     selection.selection_key(),
                 )
 
+    async def send_lesson_reminders(self) -> None:
+        """Send lesson reminders shortly before each lesson starts."""
+        if not self.settings.reminder_enabled:
+            LOGGER.debug("Reminder scan skipped because reminders are disabled")
+            return
+
+        selections = await asyncio.to_thread(self.storage.list_chat_selections)
+        if not selections:
+            LOGGER.debug("Reminder scan skipped because no chats have a saved study selection")
+            return
+
+        now = get_now(self.settings.zoneinfo)
+        start_date = now.date()
+        end_date = start_date + timedelta(days=1)
+        lower_bound_minutes, upper_bound_minutes = self._reminder_window_bounds()
+        LOGGER.info(
+            "Reminder scan started: chats=%s window=%s..%s minutes",
+            len(selections),
+            lower_bound_minutes,
+            upper_bound_minutes,
+        )
+
+        targets_by_key: dict[tuple[int | None, int | None, int | None, str], ResolvedSemesterProgram] = {}
+        events_by_semester_program: dict[int, list[ScheduleEvent]] = {}
+        reminders_sent = 0
+        skipped_duplicates = 0
+
+        for selection in selections:
+            if not selection.is_complete():
+                LOGGER.warning(
+                    "Reminder scan skipped incomplete selection for chat_id=%s",
+                    selection.chat_id,
+                )
+                continue
+
+            selection_key = selection.selection_key()
+            try:
+                if selection_key not in targets_by_key:
+                    _, target = await self._resolve_selection_context(selection)
+                    targets_by_key[selection_key] = target
+
+                target = targets_by_key[selection_key]
+                if target.semester_program_id not in events_by_semester_program:
+                    events_by_semester_program[target.semester_program_id] = await asyncio.to_thread(
+                        self.api_client.get_events_for_range,
+                        target.semester_program_id,
+                        start_date,
+                        end_date,
+                    )
+
+                due_events = self._due_reminder_events(
+                    events_by_semester_program[target.semester_program_id],
+                    now,
+                    lower_bound_minutes,
+                    upper_bound_minutes,
+                )
+                for event in due_events:
+                    if event.start_time is None:
+                        continue
+
+                    reminder_key = self._build_reminder_key(
+                        selection.chat_id,
+                        target.semester_program_id,
+                        event,
+                    )
+                    acquired = await asyncio.to_thread(
+                        self.storage.try_acquire_reminder_delivery,
+                        selection.chat_id,
+                        reminder_key,
+                        event.event_date,
+                        event.start_time.strftime("%H:%M:%S"),
+                        target.semester_program_id,
+                    )
+                    if not acquired:
+                        skipped_duplicates += 1
+                        continue
+
+                    try:
+                        await self._send_text(
+                            selection.chat_id,
+                            format_reminder(event, self.settings.reminder_minutes_before),
+                            reply_markup=self._main_menu(selection.chat_id),
+                        )
+                        reminders_sent += 1
+                    except Exception:
+                        await asyncio.to_thread(
+                            self.storage.delete_reminder_delivery,
+                            selection.chat_id,
+                            reminder_key,
+                        )
+                        raise
+            except Exception:
+                LOGGER.exception(
+                    "Reminder delivery failed for chat_id=%s selection=%s",
+                    selection.chat_id,
+                    selection.selection_key(),
+                )
+
+        LOGGER.info(
+            "Reminder scan finished: chats_scanned=%s reminders_sent=%s duplicates_skipped=%s",
+            len(selections),
+            reminders_sent,
+            skipped_duplicates,
+        )
+
     def _register_handlers(self) -> None:
         self.router.message.register(self.cmd_start, CommandStart())
         self.router.message.register(self.cmd_today, Command("today"))
@@ -253,6 +363,7 @@ class ScheduleBotApp:
         self.router.message.register(self.cmd_subjects, Command("subjects"))
         self.router.message.register(self.cmd_status, Command("status"))
         self.router.message.register(self.cmd_refresh, Command("refresh"))
+        self.router.message.register(self.cmd_stats, Command("stats"))
         self.router.message.register(self.btn_today, F.text == BUTTON_TODAY)
         self.router.message.register(self.btn_tomorrow, F.text == BUTTON_TOMORROW)
         self.router.message.register(self.btn_week, F.text == BUTTON_WEEK)
@@ -260,6 +371,7 @@ class ScheduleBotApp:
         self.router.message.register(self.btn_refresh, F.text == BUTTON_REFRESH)
         self.router.message.register(self.btn_status, F.text == BUTTON_STATUS)
         self.router.message.register(self.btn_change_selection, F.text == BUTTON_CHANGE_SELECTION)
+        self.router.message.register(self.btn_stats, F.text == BUTTON_STATS)
         self.router.callback_query.register(
             self.handle_configuration_callback,
             F.data.startswith(f"{CALLBACK_PREFIX}:"),
@@ -337,6 +449,15 @@ class ScheduleBotApp:
             fallback_message="I couldn't refresh the schedule right now. Please try again.",
         )
 
+    async def cmd_stats(self, message: Message) -> None:
+        await self._run_action(
+            chat_id=message.chat.id,
+            action="stats",
+            source="command",
+            callback=lambda: self._show_stats(message.chat.id),
+            fallback_message="I couldn't load the bot statistics right now. Please try again.",
+        )
+
     async def btn_today(self, message: Message) -> None:
         await self._run_action(
             chat_id=message.chat.id,
@@ -400,6 +521,15 @@ class ScheduleBotApp:
             fallback_message="I couldn't restart the selection flow right now. Please try again.",
         )
 
+    async def btn_stats(self, message: Message) -> None:
+        await self._run_action(
+            chat_id=message.chat.id,
+            action="stats",
+            source="button",
+            callback=lambda: self._show_stats(message.chat.id),
+            fallback_message="I couldn't load the bot statistics right now. Please try again.",
+        )
+
     async def handle_configuration_callback(self, callback: CallbackQuery) -> None:
         data = callback.data or ""
         parts = data.split(":")
@@ -411,6 +541,7 @@ class ScheduleBotApp:
             return
 
         try:
+            await asyncio.to_thread(self.storage.touch_chat_activity, chat_id, False)
             action = parts[1]
             mode = parts[2]
 
@@ -502,6 +633,11 @@ class ScheduleBotApp:
             chat_id,
         )
         try:
+            await asyncio.to_thread(
+                self.storage.touch_chat_activity,
+                chat_id,
+                action in SCHEDULE_REQUEST_ACTIONS,
+            )
             await callback()
         except Exception:
             LOGGER.exception(
@@ -587,7 +723,7 @@ class ScheduleBotApp:
                 subjects,
                 heading=self._subjects_heading(selection, target),
             ),
-            reply_markup=self._main_menu(),
+            reply_markup=self._main_menu(chat_id),
         )
 
     async def _show_status(self, chat_id: int) -> None:
@@ -641,7 +777,7 @@ class ScheduleBotApp:
             timezone=self.settings.timezone,
         )
         status_text = text if not heading_lines else "\n".join(heading_lines + [text])
-        await self._send_text(chat_id, status_text, reply_markup=self._main_menu())
+        await self._send_text(chat_id, status_text, reply_markup=self._main_menu(chat_id))
 
     async def _show_refresh(self, chat_id: int) -> None:
         context = await self._resolve_chat_target(chat_id)
@@ -659,7 +795,26 @@ class ScheduleBotApp:
             await self._send_text(chat_id, f"Refresh failed: {exc}")
             return
 
-        await self._send_text(chat_id, format_changes(changes), reply_markup=self._main_menu())
+        await self._send_text(chat_id, format_changes(changes), reply_markup=self._main_menu(chat_id))
+
+    async def _show_stats(self, chat_id: int) -> None:
+        if not self.settings.is_admin_chat(chat_id):
+            LOGGER.info("Stats access denied for chat_id=%s", chat_id)
+            await self._send_text(chat_id, "Access denied.")
+            return
+
+        LOGGER.info("Stats requested by admin chat_id=%s", chat_id)
+        stats = await asyncio.to_thread(self.storage.get_bot_usage_stats)
+        await self._send_text(
+            chat_id,
+            format_admin_stats(
+                stats=stats,
+                scheduler_enabled=self.settings.enable_scheduler,
+                reminder_enabled=self.settings.reminder_enabled,
+                timezone=self.settings.timezone,
+            ),
+            reply_markup=self._main_menu(chat_id),
+        )
 
     async def _send_schedule_for_predefined_range(
         self,
@@ -738,7 +893,7 @@ class ScheduleBotApp:
                 events,
                 context_line=context_line,
             ),
-            reply_markup=self._main_menu(),
+            reply_markup=self._main_menu(chat_id),
         )
 
     async def _resolve_chat_target(
@@ -780,7 +935,7 @@ class ScheduleBotApp:
                     await self._send_text(
                         chat_id,
                         f"I couldn't validate your saved selection right now: {exc}",
-                        reply_markup=self._main_menu(),
+                        reply_markup=self._main_menu(chat_id),
                     )
                 else:
                     LOGGER.warning(
@@ -822,7 +977,7 @@ class ScheduleBotApp:
                 await self._send_text(
                     chat_id,
                     f"Your saved selection is currently unavailable: {exc}\nUse Change selection to choose another one.",
-                    reply_markup=self._main_menu(),
+                    reply_markup=self._main_menu(chat_id),
                 )
             else:
                 LOGGER.warning(
@@ -851,7 +1006,7 @@ class ScheduleBotApp:
                 await self._send_text(
                     chat_id,
                     f"I couldn't resolve your saved selection right now: {exc}",
-                    reply_markup=self._main_menu(),
+                    reply_markup=self._main_menu(chat_id),
                 )
             else:
                 LOGGER.warning(
@@ -1042,7 +1197,7 @@ class ScheduleBotApp:
                             selection_key,
                             f"I couldn't load the scheduled {label.lower()} update right now.",
                         ),
-                        reply_markup=self._main_menu(),
+                        reply_markup=self._main_menu(selection.chat_id),
                     )
                     continue
 
@@ -1054,14 +1209,14 @@ class ScheduleBotApp:
                             target.semester_program_id,
                             f"I couldn't load the scheduled {label.lower()} update right now.",
                         ),
-                        reply_markup=self._main_menu(),
+                        reply_markup=self._main_menu(selection.chat_id),
                     )
                     continue
 
                 await self._send_text_safe(
                     selection.chat_id,
                     text,
-                    reply_markup=self._main_menu(),
+                    reply_markup=self._main_menu(selection.chat_id),
                 )
             except Exception:
                 LOGGER.exception(
@@ -1171,6 +1326,46 @@ class ScheduleBotApp:
                 latest = candidate
         return latest
 
+    def _reminder_window_bounds(self) -> tuple[int, int]:
+        tolerance_minutes = max(self.settings.reminder_check_interval_minutes, 5)
+        lower_bound = max(0, self.settings.reminder_minutes_before - tolerance_minutes)
+        return lower_bound, self.settings.reminder_minutes_before
+
+    def _due_reminder_events(
+        self,
+        events: list[ScheduleEvent],
+        now: datetime,
+        lower_bound_minutes: int,
+        upper_bound_minutes: int,
+    ) -> list[ScheduleEvent]:
+        due_events: list[ScheduleEvent] = []
+        for event in events:
+            lesson_start = combine_local_datetime(
+                event.event_date,
+                event.start_time,
+                self.settings.zoneinfo,
+            )
+            if lesson_start is None:
+                continue
+
+            minutes_until_start = (lesson_start - now).total_seconds() / 60
+            if lower_bound_minutes <= minutes_until_start <= upper_bound_minutes:
+                due_events.append(event)
+        return due_events
+
+    @staticmethod
+    def _build_reminder_key(
+        chat_id: int,
+        semester_program_id: int,
+        event: ScheduleEvent,
+    ) -> str:
+        start_time = event.start_time.isoformat() if event.start_time is not None else "TBA"
+        fingerprint = (
+            f"{chat_id}|{semester_program_id}|{event.event_date.isoformat()}|{start_time}|"
+            f"{event.stable_id()}|{event.title}|{event.lecturer}|{event.room}"
+        )
+        return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
+
     async def _configure_telegram_commands(self) -> None:
         await self.bot.set_my_commands(
             [
@@ -1185,22 +1380,25 @@ class ScheduleBotApp:
             ]
         )
 
-    @staticmethod
-    def _main_menu() -> ReplyKeyboardMarkup:
-        return ReplyKeyboardMarkup(
-            keyboard=[
-                [
-                    KeyboardButton(text=BUTTON_TODAY),
-                    KeyboardButton(text=BUTTON_TOMORROW),
-                    KeyboardButton(text=BUTTON_WEEK),
-                ],
-                [
-                    KeyboardButton(text=BUTTON_SUBJECTS),
-                    KeyboardButton(text=BUTTON_REFRESH),
-                    KeyboardButton(text=BUTTON_STATUS),
-                ],
-                [KeyboardButton(text=BUTTON_CHANGE_SELECTION)],
+    def _main_menu(self, chat_id: int | None = None) -> ReplyKeyboardMarkup:
+        keyboard = [
+            [
+                KeyboardButton(text=BUTTON_TODAY),
+                KeyboardButton(text=BUTTON_TOMORROW),
+                KeyboardButton(text=BUTTON_WEEK),
             ],
+            [
+                KeyboardButton(text=BUTTON_SUBJECTS),
+                KeyboardButton(text=BUTTON_REFRESH),
+                KeyboardButton(text=BUTTON_STATUS),
+            ],
+        ]
+        final_row = [KeyboardButton(text=BUTTON_CHANGE_SELECTION)]
+        if chat_id is not None and self.settings.is_admin_chat(chat_id):
+            final_row.append(KeyboardButton(text=BUTTON_STATS))
+        keyboard.append(final_row)
+        return ReplyKeyboardMarkup(
+            keyboard=keyboard,
             resize_keyboard=True,
             is_persistent=True,
             input_field_placeholder="Choose a schedule action",
@@ -1252,7 +1450,7 @@ class ScheduleBotApp:
         self._selection_drafts.pop(chat_id, None)
         current_selection = await asyncio.to_thread(self.storage.get_chat_selection, chat_id)
         text = "Setup cancelled. Use Change selection when you want to update the study selection."
-        reply_markup = self._main_menu() if current_selection is not None else ReplyKeyboardRemove()
+        reply_markup = self._main_menu(chat_id) if current_selection is not None else ReplyKeyboardRemove()
 
         if message is not None:
             await self._upsert_selection_message(
@@ -1734,7 +1932,7 @@ class ScheduleBotApp:
         await self._send_text(
             chat_id,
             "The main menu is ready below. Use Change selection whenever you want to switch program family, course, or group.",
-            reply_markup=self._main_menu(),
+            reply_markup=self._main_menu(chat_id),
         )
 
     def _build_setup_text(

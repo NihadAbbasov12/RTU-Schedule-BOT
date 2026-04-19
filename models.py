@@ -193,6 +193,18 @@ class ScheduleDiff:
     description: str
 
 
+@dataclass(slots=True, frozen=True)
+class BotUsageStats:
+    """Aggregated bot usage statistics."""
+
+    total_chats_ever: int
+    chats_with_saved_selection: int
+    active_chats_last_7_days: int
+    active_chats_last_30_days: int
+    total_reminders_sent: int
+    total_schedule_requests: int
+
+
 def group_events_by_day(events: list[ScheduleEvent]) -> dict[date, list[ScheduleEvent]]:
     """Group events by calendar date."""
     grouped: dict[date, list[ScheduleEvent]] = {}

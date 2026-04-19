@@ -1,4 +1,4 @@
-"""APScheduler integration for daily Telegram delivery."""
+"""APScheduler integration for Telegram delivery and reminders."""
 
 from __future__ import annotations
 
@@ -24,12 +24,14 @@ class BotScheduler:
         send_today: Callable[[], Awaitable[None]],
         send_tomorrow: Callable[[], Awaitable[None]],
         send_weekend: Callable[[], Awaitable[None]],
+        send_reminders: Callable[[], Awaitable[None]],
     ) -> None:
         self.settings = settings
         self._scheduler = AsyncIOScheduler(timezone=ZoneInfo(settings.timezone))
         self._send_today = send_today
         self._send_tomorrow = send_tomorrow
         self._send_weekend = send_weekend
+        self._send_reminders = send_reminders
 
     def start(self) -> None:
         """Start the daily jobs."""
@@ -57,6 +59,15 @@ class BotScheduler:
             misfire_grace_time=900,
             coalesce=True,
         )
+        if self.settings.reminder_enabled:
+            self._scheduler.add_job(
+                self._wrap_job("send_lesson_reminders", self._send_reminders),
+                trigger=IntervalTrigger(minutes=self.settings.reminder_check_interval_minutes),
+                id="send_lesson_reminders",
+                replace_existing=True,
+                misfire_grace_time=300,
+                coalesce=True,
+            )
         self._scheduler.start()
 
     def shutdown(self) -> None:

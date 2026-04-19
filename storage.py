@@ -7,11 +7,11 @@ import json
 import logging
 import sqlite3
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
 
-from models import ChatSelection, ScheduleDiff, ScheduleEvent, iter_month_dates
+from models import BotUsageStats, ChatSelection, ScheduleDiff, ScheduleEvent, iter_month_dates
 
 LOGGER = logging.getLogger(__name__)
 
@@ -101,7 +101,32 @@ class SnapshotStorage:
                 )
                 """
             )
+            self.connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chat_activity (
+                    chat_id INTEGER PRIMARY KEY,
+                    first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    interaction_count INTEGER NOT NULL DEFAULT 0,
+                    schedule_request_count INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            self.connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS reminder_deliveries (
+                    chat_id INTEGER NOT NULL,
+                    reminder_key TEXT NOT NULL,
+                    lesson_date TEXT NOT NULL,
+                    lesson_start TEXT NOT NULL,
+                    semester_program_id INTEGER NOT NULL,
+                    sent_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (chat_id, reminder_key)
+                )
+                """
+            )
             self._ensure_chat_preferences_columns()
+            self._ensure_chat_activity_columns()
             self.connection.commit()
             self._migrate_legacy_data()
 
@@ -121,6 +146,20 @@ class SnapshotStorage:
                 continue
             self.connection.execute(
                 f"ALTER TABLE chat_preferences ADD COLUMN {column_name} {column_type}"
+            )
+
+    def _ensure_chat_activity_columns(self) -> None:
+        columns = self._table_columns("chat_activity")
+        for column_name, column_type, default_sql in (
+            ("first_seen_at", "TEXT", "CURRENT_TIMESTAMP"),
+            ("last_seen_at", "TEXT", "CURRENT_TIMESTAMP"),
+            ("interaction_count", "INTEGER", "0"),
+            ("schedule_request_count", "INTEGER", "0"),
+        ):
+            if column_name in columns:
+                continue
+            self.connection.execute(
+                f"ALTER TABLE chat_activity ADD COLUMN {column_name} {column_type} NOT NULL DEFAULT {default_sql}"
             )
 
     def _table_columns(self, table_name: str) -> set[str]:
@@ -186,6 +225,24 @@ class SnapshotStorage:
                 SET program_family = COALESCE(program_family, program_title)
                 """
             )
+            self.connection.execute(
+                """
+                INSERT OR IGNORE INTO chat_activity (
+                    chat_id,
+                    first_seen_at,
+                    last_seen_at,
+                    interaction_count,
+                    schedule_request_count
+                )
+                SELECT
+                    chat_id,
+                    COALESCE(updated_at, CURRENT_TIMESTAMP),
+                    COALESCE(updated_at, CURRENT_TIMESTAMP),
+                    0,
+                    0
+                FROM chat_preferences
+                """
+            )
             self.connection.commit()
             return
 
@@ -221,6 +278,24 @@ class SnapshotStorage:
             """
             UPDATE chat_preferences
             SET program_family = COALESCE(program_family, program_title)
+            """
+        )
+        self.connection.execute(
+            """
+            INSERT OR IGNORE INTO chat_activity (
+                chat_id,
+                first_seen_at,
+                last_seen_at,
+                interaction_count,
+                schedule_request_count
+            )
+            SELECT
+                chat_id,
+                COALESCE(updated_at, CURRENT_TIMESTAMP),
+                COALESCE(updated_at, CURRENT_TIMESTAMP),
+                0,
+                0
+            FROM chat_preferences
             """
         )
         self.connection.commit()
@@ -286,6 +361,37 @@ class SnapshotStorage:
                 ),
             )
             self.connection.commit()
+
+    def touch_chat_activity(self, chat_id: int, schedule_request: bool = False) -> None:
+        """Record that a chat interacted with the bot."""
+        schedule_request_increment = 1 if schedule_request else 0
+        with self._lock:
+            self.connection.execute(
+                """
+                INSERT INTO chat_activity (
+                    chat_id,
+                    first_seen_at,
+                    last_seen_at,
+                    interaction_count,
+                    schedule_request_count
+                )
+                VALUES (?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    last_seen_at = CURRENT_TIMESTAMP,
+                    interaction_count = chat_activity.interaction_count + 1,
+                    schedule_request_count = (
+                        chat_activity.schedule_request_count + excluded.schedule_request_count
+                    )
+                """,
+                (chat_id, schedule_request_increment),
+            )
+            self.connection.commit()
+
+        LOGGER.debug(
+            "Updated chat activity: chat_id=%s schedule_request=%s",
+            chat_id,
+            schedule_request,
+        )
 
     def get_chat_selection(self, chat_id: int) -> ChatSelection | None:
         """Load the current RTU study selection for a chat."""
@@ -373,6 +479,116 @@ class SnapshotStorage:
             )
             for row in rows
         ]
+
+    def try_acquire_reminder_delivery(
+        self,
+        chat_id: int,
+        reminder_key: str,
+        lesson_date: date,
+        lesson_start: str,
+        semester_program_id: int,
+    ) -> bool:
+        """Reserve a reminder slot if it has not been sent before."""
+        with self._lock:
+            cursor = self.connection.execute(
+                """
+                INSERT OR IGNORE INTO reminder_deliveries (
+                    chat_id,
+                    reminder_key,
+                    lesson_date,
+                    lesson_start,
+                    semester_program_id,
+                    sent_at
+                )
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                (
+                    chat_id,
+                    reminder_key,
+                    lesson_date.isoformat(),
+                    lesson_start,
+                    semester_program_id,
+                ),
+            )
+            self.connection.commit()
+
+        inserted = cursor.rowcount == 1
+        if not inserted:
+            LOGGER.debug(
+                "Skipped duplicate reminder reservation: chat_id=%s semester_program_id=%s reminder_key=%s",
+                chat_id,
+                semester_program_id,
+                reminder_key,
+            )
+        return inserted
+
+    def delete_reminder_delivery(self, chat_id: int, reminder_key: str) -> None:
+        """Release a reserved reminder after a failed send."""
+        with self._lock:
+            self.connection.execute(
+                """
+                DELETE FROM reminder_deliveries
+                WHERE chat_id = ? AND reminder_key = ?
+                """,
+                (chat_id, reminder_key),
+            )
+            self.connection.commit()
+
+    def get_bot_usage_stats(self, reference_time: datetime | None = None) -> BotUsageStats:
+        """Return aggregated bot usage statistics."""
+        if reference_time is None:
+            current_time = datetime.now(timezone.utc).replace(tzinfo=None)
+        elif reference_time.tzinfo is not None:
+            current_time = reference_time.astimezone(timezone.utc).replace(tzinfo=None)
+        else:
+            current_time = reference_time
+        active_7_days_since = (current_time - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+        active_30_days_since = (current_time - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+
+        with self._lock:
+            total_chats_ever = int(
+                self.connection.execute("SELECT COUNT(*) FROM chat_activity").fetchone()[0]
+            )
+            chats_with_saved_selection = int(
+                self.connection.execute("SELECT COUNT(*) FROM chat_preferences").fetchone()[0]
+            )
+            active_chats_last_7_days = int(
+                self.connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM chat_activity
+                    WHERE last_seen_at >= ?
+                    """,
+                    (active_7_days_since,),
+                ).fetchone()[0]
+            )
+            active_chats_last_30_days = int(
+                self.connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM chat_activity
+                    WHERE last_seen_at >= ?
+                    """,
+                    (active_30_days_since,),
+                ).fetchone()[0]
+            )
+            total_reminders_sent = int(
+                self.connection.execute("SELECT COUNT(*) FROM reminder_deliveries").fetchone()[0]
+            )
+            total_schedule_requests = int(
+                self.connection.execute(
+                    "SELECT COALESCE(SUM(schedule_request_count), 0) FROM chat_activity"
+                ).fetchone()[0]
+            )
+
+        return BotUsageStats(
+            total_chats_ever=total_chats_ever,
+            chats_with_saved_selection=chats_with_saved_selection,
+            active_chats_last_7_days=active_chats_last_7_days,
+            active_chats_last_30_days=active_chats_last_30_days,
+            total_reminders_sent=total_reminders_sent,
+            total_schedule_requests=total_schedule_requests,
+        )
 
     def get_snapshot(
         self,

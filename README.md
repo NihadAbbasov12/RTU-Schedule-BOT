@@ -2,31 +2,32 @@
 
 Python 3.11 Telegram bot for the public RTU lesson schedule site at `https://nodarbibas.rtu.lv`.
 
-The bot is now locked to the current Foreign Students setup and uses a simplified onboarding flow:
+The bot is locked to the current Foreign Students setup and uses a simplified onboarding flow:
 
 - Study period: `2025/2026 Spring semester (25/26-SP)`
 - Department: `Foreign Students Department (02A00)`
 - User choice: `program family -> course -> group`
 
-## What The Bot Does
+## Features
 
-- Fetches RTU public schedule data without browser automation
-- Groups duplicate-looking RTU program rows into clean program-family buttons
-- Resolves one underlying RTU program row per family for course and group loading
-- Filters group lists to keep Telegram selection clean and numerically sorted
-- Stores one saved study selection per chat in SQLite
-- Supports `Today`, `Tomorrow`, `Week`, `Subjects`, `Refresh`, `Status`, and `Change selection`
-- Sends scheduled `Today` and `Tomorrow` messages when the scheduler is enabled
-- Stores snapshots and reports schedule changes on refresh
+- Public RTU schedule fetching without browser automation
+- Per-chat saved selection in SQLite
+- Telegram commands and persistent reply-keyboard actions
+- Daily scheduled `Today` and `Tomorrow` messages
+- Weekend notification after the last lesson of the academic week
+- Automatic reminder delivery 30 minutes before each lesson
+- Duplicate reminder protection in SQLite
+- Snapshot refresh and change detection
+- Admin-only bot usage statistics
 
-## Current Selection Flow
+## Main User Flow
 
 When a user opens the bot and presses `/start`, the bot automatically uses:
 
 - `2025/2026 Spring semester (25/26-SP)`
 - `Foreign Students Department (02A00)`
 
-Then it shows only deduplicated program-family buttons, for example:
+Then it shows deduplicated program-family buttons, for example:
 
 - `Computer Systems`
 - `Economics`
@@ -40,7 +41,9 @@ After that:
 3. Choose the filtered group
 4. The bot saves the resolved selection and shows the main menu
 
-The main menu stays visible as a persistent reply keyboard:
+## Main Menu
+
+All users see:
 
 - `Today`
 - `Tomorrow`
@@ -50,19 +53,49 @@ The main menu stays visible as a persistent reply keyboard:
 - `Status`
 - `Change selection`
 
-## Status Output
+Admin chats also see:
 
-`Status` shows:
+- `Stats`
 
-- fixed study period
-- fixed department
-- selected program family
-- underlying RTU program title and code actually used
-- course
-- group
-- resolved `semesterProgramId`
+## Reminders
+
+The bot can send a reminder shortly before a lesson starts.
+
+Default behavior:
+
+- reminder lead time: 30 minutes
+- reminder check interval: every 5 minutes
+- duplicate reminder prevention: enabled through SQLite reminder keys
+
+Example reminder:
+
+```text
+Reminder
+
+In 30 minutes you have:
+Discrete Mathematics
+14:30-16:05
+Lecturer: I. Kremere
+Room: Zun. 10-405
+```
+
+## Admin Stats
+
+Admins can use `/stats` or the `Stats` button.
+
+Admin stats include:
+
+- total chats ever seen
+- chats with saved selection
+- active chats in the last 7 days
+- active chats in the last 30 days
+- total reminders sent
+- total schedule requests handled
+- scheduler enabled or disabled
+- reminder enabled or disabled
 - timezone
-- scheduler state
+
+Admin access is controlled by `ADMIN_CHAT_IDS`.
 
 ## RTU Endpoints Used
 
@@ -103,11 +136,18 @@ TELEGRAM_BOT_TOKEN=your_bot_token
 TELEGRAM_CHAT_ID=your_chat_id
 ```
 
+If you want admin access to `/stats`, add chat IDs:
+
+```env
+ADMIN_CHAT_IDS=123456789,987654321
+```
+
 ## Example `.env`
 
 ```env
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
+ADMIN_CHAT_IDS=
 RTU_BASE_URL=https://nodarbibas.rtu.lv
 RTU_LANG=en
 RTU_SEMESTER_ID=29
@@ -118,6 +158,9 @@ ENABLE_SCHEDULER=true
 DAILY_TODAY_HOUR=7
 DAILY_TOMORROW_HOUR=19
 WEEKEND_CHECK_INTERVAL_MINUTES=15
+REMINDER_ENABLED=true
+REMINDER_MINUTES_BEFORE=30
+REMINDER_CHECK_INTERVAL_MINUTES=5
 TIMEZONE=Europe/Riga
 DB_PATH=rtu_schedule.db
 LOG_LEVEL=INFO
@@ -127,7 +170,7 @@ REQUEST_RETRIES=5
 REQUEST_BACKOFF_SECONDS=0.8
 ```
 
-Legacy/default RTU values are still supported in the environment for migration and deterministic representative selection:
+Legacy/default RTU values are still supported for migration and deterministic representative selection:
 
 - `RTU_PROGRAM_ID`
 - `RTU_COURSE_ID`
@@ -140,20 +183,31 @@ Legacy/default RTU values are still supported in the environment for migration a
 python app.py
 ```
 
+## SQLite Storage
+
+The bot stores:
+
+- chat selections
+- per-chat activity timestamps and counters
+- reminder delivery log
+- snapshot history for schedule change detection
+- weekend notification state
+
 ## Project Files
 
 - `app.py` - application entrypoint
-- `bot.py` - Telegram handlers, onboarding flow, schedule actions, scheduled delivery
+- `bot.py` - Telegram handlers, onboarding flow, schedule actions, reminders, admin stats
 - `config.py` - environment loading
 - `formatter.py` - Telegram-friendly message formatting
 - `models.py` - typed domain models and date helpers
 - `rtu_api.py` - RTU API client, family grouping, course and group resolution
 - `scheduler.py` - APScheduler integration
-- `storage.py` - SQLite storage for chat selections, snapshots, and weekend notifications
+- `storage.py` - SQLite storage for chat selections, reminders, stats, snapshots, and weekend notifications
 
 ## Notes
 
 - The bot loads `.env` automatically with `python-dotenv`
-- The scheduler can be disabled with `ENABLE_SCHEDULER=false`
+- `ENABLE_SCHEDULER=false` disables all scheduled jobs
+- `REMINDER_ENABLED=false` disables lesson reminders while keeping other scheduler jobs available
+- Duplicate reminders are prevented by a stable reminder key per chat and lesson
 - `Refresh` compares stored daily snapshots and reports added, removed, or changed lessons
-- The grouping and filtering layer is designed for the current Foreign Students Department structure, not for all RTU departments at once

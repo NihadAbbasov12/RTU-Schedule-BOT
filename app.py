@@ -48,6 +48,7 @@ async def main() -> None:
                 send_today=bot_app.send_today_scheduled,
                 send_tomorrow=bot_app.send_tomorrow_scheduled,
                 send_weekend=bot_app.send_weekend_notifications,
+                send_reminders=bot_app.send_lesson_reminders,
             )
             scheduler.start()
             logger.info("Scheduler enabled")

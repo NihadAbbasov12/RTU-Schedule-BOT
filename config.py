@@ -31,6 +31,20 @@ def _parse_float(value: str | None, default: float) -> float:
     return float(value)
 
 
+def _parse_int_set(value: str | None) -> frozenset[int]:
+    """Parse a comma-separated list of integers."""
+    if value is None or value.strip() == "":
+        return frozenset()
+
+    items: set[int] = set()
+    for raw_item in value.split(","):
+        cleaned = raw_item.strip()
+        if not cleaned:
+            continue
+        items.add(int(cleaned))
+    return frozenset(items)
+
+
 def _require(name: str, value: str | None) -> str:
     """Ensure a required environment variable is present."""
     if value is None or value.strip() == "":
@@ -59,6 +73,10 @@ class Settings:
     daily_today_hour: int = 7
     daily_tomorrow_hour: int = 19
     weekend_check_interval_minutes: int = 15
+    reminder_enabled: bool = True
+    reminder_minutes_before: int = 30
+    reminder_check_interval_minutes: int = 5
+    admin_chat_ids: frozenset[int] = frozenset()
     timezone: str = "Europe/Riga"
     db_path: Path = Path("rtu_schedule.db")
     log_level: str = "INFO"
@@ -71,6 +89,10 @@ class Settings:
     def zoneinfo(self) -> ZoneInfo:
         """Return the configured timezone as a ZoneInfo instance."""
         return ZoneInfo(self.timezone)
+
+    def is_admin_chat(self, chat_id: int) -> bool:
+        """Return whether the chat is allowed to access admin actions."""
+        return chat_id in self.admin_chat_ids
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -109,6 +131,14 @@ class Settings:
             weekend_check_interval_minutes=(
                 _parse_int(os.getenv("WEEKEND_CHECK_INTERVAL_MINUTES"), 15) or 15
             ),
+            reminder_enabled=_parse_bool(os.getenv("REMINDER_ENABLED"), True),
+            reminder_minutes_before=(
+                _parse_int(os.getenv("REMINDER_MINUTES_BEFORE"), 30) or 30
+            ),
+            reminder_check_interval_minutes=(
+                _parse_int(os.getenv("REMINDER_CHECK_INTERVAL_MINUTES"), 5) or 5
+            ),
+            admin_chat_ids=_parse_int_set(os.getenv("ADMIN_CHAT_IDS")),
             timezone=os.getenv("TIMEZONE", "Europe/Riga").strip() or "Europe/Riga",
             db_path=Path(os.getenv("DB_PATH", "rtu_schedule.db")),
             log_level=os.getenv("LOG_LEVEL", "INFO").strip() or "INFO",

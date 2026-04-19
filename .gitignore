@@ -1,5 +1,23 @@
+# Virtual environment
 .venv/
-__pycache__/
+venv/
+
+# Environment variables / secrets
 .env
-*.pyc
-*.pyo
+.env.*
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local databases
+*.db
+*.sqlite3
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+
+# OS files
+.DS_Store
+Thumbs.db

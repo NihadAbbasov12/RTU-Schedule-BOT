@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import date
 
-from models import ScheduleDiff, ScheduleEvent, Subject, group_events_by_day
+from models import BotUsageStats, ScheduleDiff, ScheduleEvent, Subject, group_events_by_day
 
 _MARKDOWN_V2_SPECIALS = r"_*[]()~`>#+-=|{}.!"
 
@@ -145,6 +145,42 @@ def format_changes(changes: list[ScheduleDiff]) -> str:
                 change.description,
             ]
         )
+    return "\n".join(lines)
+
+
+def format_reminder(event: ScheduleEvent, minutes_before: int) -> str:
+    """Format a lesson reminder."""
+    lines = [
+        "Reminder",
+        "",
+        f"In {minutes_before} minutes you have:",
+        event.title,
+        _format_time_range(event),
+        f"Lecturer: {event.lecturer or 'TBA'}",
+        f"Room: {event.room or 'TBA'}",
+    ]
+    return "\n".join(lines)
+
+
+def format_admin_stats(
+    stats: BotUsageStats,
+    scheduler_enabled: bool,
+    reminder_enabled: bool,
+    timezone: str,
+) -> str:
+    """Format admin-only usage statistics."""
+    lines = [
+        "Bot Stats",
+        f"total chats ever: {stats.total_chats_ever}",
+        f"chats with saved selection: {stats.chats_with_saved_selection}",
+        f"active chats last 7 days: {stats.active_chats_last_7_days}",
+        f"active chats last 30 days: {stats.active_chats_last_30_days}",
+        f"total reminders sent: {stats.total_reminders_sent}",
+        f"total schedule requests: {stats.total_schedule_requests}",
+        f"scheduler: {'enabled' if scheduler_enabled else 'disabled'}",
+        f"reminders: {'enabled' if reminder_enabled else 'disabled'}",
+        f"timezone: {timezone}",
+    ]
     return "\n".join(lines)
 
 
