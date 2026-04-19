@@ -14,9 +14,17 @@ def escape_telegram_markdown(text: str) -> str:
     return "".join(f"\\{char}" if char in _MARKDOWN_V2_SPECIALS else char for char in text)
 
 
-def format_daily_schedule(label: str, target_date: date, events: list[ScheduleEvent]) -> str:
+def format_daily_schedule(
+    label: str,
+    target_date: date,
+    events: list[ScheduleEvent],
+    context_line: str | None = None,
+) -> str:
     """Format a single-day schedule message."""
-    lines = [label, _format_date_header(target_date)]
+    lines = [label]
+    if context_line:
+        lines.append(context_line)
+    lines.append(_format_date_header(target_date))
     if not events:
         lines.extend(["", "No lessons scheduled."])
         return "\n".join(lines)
@@ -38,9 +46,13 @@ def format_range_schedule(
     start_date: date,
     end_date: date,
     events: list[ScheduleEvent],
+    context_line: str | None = None,
 ) -> str:
     """Format a multi-day schedule message."""
-    lines = [label, f"{start_date.isoformat()} to {end_date.isoformat()}"]
+    lines = [label]
+    if context_line:
+        lines.append(context_line)
+    lines.append(f"{start_date.isoformat()} to {end_date.isoformat()}")
     if not events:
         lines.extend(["", "No lessons scheduled."])
         return "\n".join(lines)
@@ -76,28 +88,42 @@ def format_subjects(subjects: list[Subject], heading: str = "Subjects") -> str:
 
 
 def format_status(
-    semester_id: int,
-    program_id: int,
-    course_id: int,
+    semester_id: int | None,
+    semester_title: str | None,
+    department_title: str | None,
+    program_family: str | None,
+    program_id: int | None,
+    program_title: str | None,
+    program_code: str | None,
+    course_id: int | None,
     group: str | None,
     semester_program_id: int | None,
     scheduler_enabled: bool,
     timezone: str,
-    program_title: str | None = None,
 ) -> str:
     """Format the bot status message."""
     selected_group = f"Group {group}" if group else "Not selected"
+    selected_period = semester_title or "Not selected"
+    selected_department = department_title or "Not selected"
+    selected_family = program_family or "Not selected"
+    resolved_program = (
+        _format_program_label(program_title, program_code)
+        if program_title
+        else "Not selected"
+    )
     resolved_value = str(semester_program_id) if semester_program_id is not None else "Not resolved"
     lines = ["Status"]
-    if program_title:
-        lines.append(f"program: {program_title}")
     lines.extend(
         [
-            f"semesterId: {semester_id}",
-            f"programId: {program_id}",
-            f"courseId: {course_id}",
-            f"selected group: {selected_group}",
-            f"resolved semesterProgramId: {resolved_value}",
+            f"study period: {selected_period}",
+            f"semesterId: {semester_id if semester_id is not None else 'Not selected'}",
+            f"department: {selected_department}",
+            f"program family: {selected_family}",
+            f"underlying RTU program: {resolved_program}",
+            f"programId: {program_id if program_id is not None else 'Not selected'}",
+            f"course: {course_id if course_id is not None else 'Not selected'}",
+            f"group: {selected_group}",
+            f"semesterProgramId: {resolved_value}",
             f"scheduler: {'enabled' if scheduler_enabled else 'disabled'}",
             f"timezone: {timezone}",
         ]
@@ -154,3 +180,11 @@ def _format_time_range(event: ScheduleEvent) -> str:
 
 def _format_date_header(value: date) -> str:
     return value.strftime("%a, %Y-%m-%d")
+
+
+def _format_program_label(program_title: str | None, program_code: str | None) -> str:
+    if not program_title:
+        return "Not selected"
+    if program_code:
+        return f"{program_title} ({program_code})"
+    return program_title

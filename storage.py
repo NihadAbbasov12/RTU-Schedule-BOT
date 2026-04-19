@@ -32,11 +32,17 @@ class SnapshotStorage:
         self,
         db_path: Path,
         legacy_chat_id: int | None = None,
+        legacy_semester_id: int | None = None,
+        legacy_program_id: int | None = None,
+        legacy_course_id: int | None = None,
         legacy_group: str | None = None,
         legacy_semester_program_id: int | None = None,
     ) -> None:
         self.db_path = db_path
         self._legacy_chat_id = legacy_chat_id
+        self._legacy_semester_id = legacy_semester_id
+        self._legacy_program_id = legacy_program_id
+        self._legacy_course_id = legacy_course_id
         self._legacy_group = legacy_group
         self._legacy_semester_program_id = legacy_semester_program_id
         self._lock = Lock()
@@ -56,6 +62,14 @@ class SnapshotStorage:
                 """
                 CREATE TABLE IF NOT EXISTS chat_preferences (
                     chat_id INTEGER PRIMARY KEY,
+                    semester_id INTEGER,
+                    semester_title TEXT,
+                    department_title TEXT,
+                    program_family TEXT,
+                    program_id INTEGER,
+                    program_title TEXT,
+                    program_code TEXT,
+                    course_id INTEGER,
                     selected_group TEXT NOT NULL,
                     semester_program_id INTEGER NOT NULL,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -87,28 +101,91 @@ class SnapshotStorage:
                 )
                 """
             )
+            self._ensure_chat_preferences_columns()
             self.connection.commit()
             self._migrate_legacy_data()
 
+    def _ensure_chat_preferences_columns(self) -> None:
+        columns = self._table_columns("chat_preferences")
+        for column_name, column_type in (
+            ("semester_id", "INTEGER"),
+            ("semester_title", "TEXT"),
+            ("department_title", "TEXT"),
+            ("program_family", "TEXT"),
+            ("program_id", "INTEGER"),
+            ("program_title", "TEXT"),
+            ("program_code", "TEXT"),
+            ("course_id", "INTEGER"),
+        ):
+            if column_name in columns:
+                continue
+            self.connection.execute(
+                f"ALTER TABLE chat_preferences ADD COLUMN {column_name} {column_type}"
+            )
+
+    def _table_columns(self, table_name: str) -> set[str]:
+        rows = self.connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+        return {str(row["name"]) for row in rows}
+
     def _migrate_legacy_data(self) -> None:
         if self._legacy_chat_id is None:
-            return
-
-        if self._legacy_group and self._legacy_semester_program_id is not None:
+            self.connection.commit()
+        elif self._legacy_group and self._legacy_semester_program_id is not None:
             self.connection.execute(
                 """
-                INSERT INTO chat_preferences (chat_id, selected_group, semester_program_id, updated_at)
-                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                INSERT INTO chat_preferences (
+                    chat_id,
+                    semester_id,
+                    program_id,
+                    course_id,
+                    selected_group,
+                    semester_program_id,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(chat_id) DO NOTHING
                 """,
                 (
                     self._legacy_chat_id,
+                    self._legacy_semester_id,
+                    self._legacy_program_id,
+                    self._legacy_course_id,
                     self._legacy_group,
                     self._legacy_semester_program_id,
                 ),
             )
 
-        if self._legacy_semester_program_id is None or not self._legacy_snapshot_table_exists():
+        if (
+            self._legacy_semester_id is not None
+            or self._legacy_program_id is not None
+            or self._legacy_course_id is not None
+        ):
+            self.connection.execute(
+                """
+                UPDATE chat_preferences
+                SET
+                    semester_id = COALESCE(semester_id, ?),
+                    program_id = COALESCE(program_id, ?),
+                    course_id = COALESCE(course_id, ?)
+                """,
+                (
+                    self._legacy_semester_id,
+                    self._legacy_program_id,
+                    self._legacy_course_id,
+                ),
+            )
+
+        if (
+            self._legacy_chat_id is None
+            or self._legacy_semester_program_id is None
+            or not self._legacy_snapshot_table_exists()
+        ):
+            self.connection.execute(
+                """
+                UPDATE chat_preferences
+                SET program_family = COALESCE(program_family, program_title)
+                """
+            )
             self.connection.commit()
             return
 
@@ -140,6 +217,12 @@ class SnapshotStorage:
                 self._legacy_semester_program_id,
             ),
         )
+        self.connection.execute(
+            """
+            UPDATE chat_preferences
+            SET program_family = COALESCE(program_family, program_title)
+            """
+        )
         self.connection.commit()
 
     def _legacy_snapshot_table_exists(self) -> bool:
@@ -152,33 +235,75 @@ class SnapshotStorage:
         ).fetchone()
         return row is not None
 
-    def save_chat_selection(
-        self,
-        chat_id: int,
-        selected_group: str,
-        semester_program_id: int,
-    ) -> None:
-        """Upsert the current RTU group selection for a chat."""
+    def save_chat_selection(self, selection: ChatSelection) -> None:
+        """Upsert the current RTU study selection for a chat."""
+        if selection.semester_program_id is None:
+            raise ValueError("semester_program_id is required when saving a chat selection")
+
         with self._lock:
             self.connection.execute(
                 """
-                INSERT INTO chat_preferences (chat_id, selected_group, semester_program_id, updated_at)
-                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                INSERT INTO chat_preferences (
+                    chat_id,
+                    semester_id,
+                    semester_title,
+                    department_title,
+                    program_family,
+                    program_id,
+                    program_title,
+                    program_code,
+                    course_id,
+                    selected_group,
+                    semester_program_id,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(chat_id) DO UPDATE SET
+                    semester_id = excluded.semester_id,
+                    semester_title = excluded.semester_title,
+                    department_title = excluded.department_title,
+                    program_family = excluded.program_family,
+                    program_id = excluded.program_id,
+                    program_title = excluded.program_title,
+                    program_code = excluded.program_code,
+                    course_id = excluded.course_id,
                     selected_group = excluded.selected_group,
                     semester_program_id = excluded.semester_program_id,
                     updated_at = CURRENT_TIMESTAMP
                 """,
-                (chat_id, selected_group, semester_program_id),
+                (
+                    selection.chat_id,
+                    selection.semester_id,
+                    selection.semester_title,
+                    selection.department_title,
+                    selection.program_family,
+                    selection.program_id,
+                    selection.program_title,
+                    selection.program_code,
+                    selection.course_id,
+                    selection.selected_group,
+                    selection.semester_program_id,
+                ),
             )
             self.connection.commit()
 
     def get_chat_selection(self, chat_id: int) -> ChatSelection | None:
-        """Load the current RTU group selection for a chat."""
+        """Load the current RTU study selection for a chat."""
         with self._lock:
             row = self.connection.execute(
                 """
-                SELECT chat_id, selected_group, semester_program_id
+                SELECT
+                    chat_id,
+                    semester_id,
+                    semester_title,
+                    department_title,
+                    program_family,
+                    program_id,
+                    program_title,
+                    program_code,
+                    course_id,
+                    selected_group,
+                    semester_program_id
                 FROM chat_preferences
                 WHERE chat_id = ?
                 """,
@@ -190,16 +315,39 @@ class SnapshotStorage:
 
         return ChatSelection(
             chat_id=int(row["chat_id"]),
+            semester_id=int(row["semester_id"]) if row["semester_id"] is not None else None,
+            semester_title=row["semester_title"],
+            department_title=row["department_title"],
+            program_family=row["program_family"],
+            program_id=int(row["program_id"]) if row["program_id"] is not None else None,
+            program_title=row["program_title"],
+            program_code=row["program_code"],
+            course_id=int(row["course_id"]) if row["course_id"] is not None else None,
             selected_group=str(row["selected_group"]),
-            semester_program_id=int(row["semester_program_id"]),
+            semester_program_id=(
+                int(row["semester_program_id"])
+                if row["semester_program_id"] is not None
+                else None
+            ),
         )
 
     def list_chat_selections(self) -> list[ChatSelection]:
-        """Return all chats with an active RTU group selection."""
+        """Return all chats with an active RTU study selection."""
         with self._lock:
             rows = self.connection.execute(
                 """
-                SELECT chat_id, selected_group, semester_program_id
+                SELECT
+                    chat_id,
+                    semester_id,
+                    semester_title,
+                    department_title,
+                    program_family,
+                    program_id,
+                    program_title,
+                    program_code,
+                    course_id,
+                    selected_group,
+                    semester_program_id
                 FROM chat_preferences
                 ORDER BY chat_id
                 """
@@ -208,8 +356,20 @@ class SnapshotStorage:
         return [
             ChatSelection(
                 chat_id=int(row["chat_id"]),
+                semester_id=int(row["semester_id"]) if row["semester_id"] is not None else None,
+                semester_title=row["semester_title"],
+                department_title=row["department_title"],
+                program_family=row["program_family"],
+                program_id=int(row["program_id"]) if row["program_id"] is not None else None,
+                program_title=row["program_title"],
+                program_code=row["program_code"],
+                course_id=int(row["course_id"]) if row["course_id"] is not None else None,
                 selected_group=str(row["selected_group"]),
-                semester_program_id=int(row["semester_program_id"]),
+                semester_program_id=(
+                    int(row["semester_program_id"])
+                    if row["semester_program_id"] is not None
+                    else None
+                ),
             )
             for row in rows
         ]

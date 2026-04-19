@@ -31,6 +31,9 @@ async def main() -> None:
     storage = SnapshotStorage(
         settings.db_path,
         legacy_chat_id=settings.telegram_chat_id,
+        legacy_semester_id=settings.rtu_semester_id,
+        legacy_program_id=settings.rtu_program_id,
+        legacy_course_id=settings.rtu_course_id,
         legacy_group=settings.rtu_group,
         legacy_semester_program_id=settings.rtu_semester_program_id,
     )

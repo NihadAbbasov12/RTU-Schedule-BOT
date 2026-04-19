@@ -11,11 +11,80 @@ from zoneinfo import ZoneInfo
 
 @dataclass(slots=True, frozen=True)
 class ChatSelection:
-    """A per-chat RTU group selection."""
+    """A per-chat RTU study selection."""
 
     chat_id: int
+    semester_id: int | None
+    semester_title: str | None
+    program_family: str | None
+    program_id: int | None
+    program_title: str | None
+    program_code: str | None
+    course_id: int | None
     selected_group: str
-    semester_program_id: int
+    semester_program_id: int | None
+    department_title: str | None = None
+
+    def is_complete(self) -> bool:
+        """Return whether the selection has enough information to resolve a target."""
+        return (
+            self.semester_id is not None
+            and self.program_id is not None
+            and self.course_id is not None
+            and bool(self.selected_group.strip())
+        )
+
+    def selection_key(self) -> tuple[int | None, int | None, int | None, str]:
+        """Return a stable key for caching or de-duplicating a chat selection."""
+        return (
+            self.semester_id,
+            self.program_id,
+            self.course_id,
+            self.selected_group,
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class StudyPeriod:
+    """A study period shown on the RTU schedule website."""
+
+    semester_id: int
+    title: str
+    short_name: str | None = None
+    start_date: date | None = None
+    end_date: date | None = None
+    active: bool = False
+
+
+@dataclass(slots=True, frozen=True)
+class StudyDepartment:
+    """A department grouping study programs on the RTU website."""
+
+    department_id: int
+    title: str
+    code: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class StudyProgram:
+    """A study program that can be selected for a study period."""
+
+    program_id: int
+    title: str
+    code: str | None = None
+    department_id: int | None = None
+    department_title: str | None = None
+    department_code: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class StudyProgramFamily:
+    """A deduplicated program family shown to Telegram users."""
+
+    family_key: str
+    display_name: str
+    representative_program: StudyProgram
+    variants: tuple[StudyProgram, ...]
 
 
 @dataclass(slots=True, frozen=True)
@@ -39,7 +108,7 @@ class ResolvedSemesterProgram:
     group: str
     program_code: str | None = None
     program_title: str | None = None
-    published: bool = True
+    published: bool | None = None
 
 
 @dataclass(slots=True, frozen=True)

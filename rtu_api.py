@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import replace
 from datetime import date, datetime, time, timezone
+from html import unescape
+from html.parser import HTMLParser
 from threading import Lock
 from typing import Any
 
@@ -14,10 +17,22 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from config import Settings
-from models import ResolvedSemesterProgram, ScheduleEvent, Subject
+from models import (
+    ChatSelection,
+    ResolvedSemesterProgram,
+    ScheduleEvent,
+    StudyDepartment,
+    StudyPeriod,
+    StudyProgram,
+    StudyProgramFamily,
+    Subject,
+)
 
 LOGGER = logging.getLogger(__name__)
 _NUMERIC_PATTERN = re.compile(r"^-?\d+(?:\.\d+)?$")
+_SEMESTER_SHORT_NAME_PATTERN = re.compile(r"^(?P<title>.+?)\s*\((?P<short>[^()]+)\)$")
+_WHITESPACE_PATTERN = re.compile(r"\s+")
+_SMALL_TITLE_WORDS = {"and", "of", "in", "to", "for"}
 
 
 class RTUAPIError(RuntimeError):
@@ -32,6 +47,67 @@ class RTUPublicationError(RTUAPIError):
     """Raised when a semester program is not published."""
 
 
+class _StudyPeriodParser(HTMLParser):
+    """Parse the study period select from the RTU homepage."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.periods: list[StudyPeriod] = []
+        self._inside_semester_select = False
+        self._inside_option = False
+        self._option_attrs: dict[str, str | None] = {}
+        self._option_chunks: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attrs_map = dict(attrs)
+        if tag == "select" and attrs_map.get("id") == "semester-id":
+            self._inside_semester_select = True
+            return
+
+        if self._inside_semester_select and tag == "option":
+            self._inside_option = True
+            self._option_attrs = attrs_map
+            self._option_chunks = []
+
+    def handle_data(self, data: str) -> None:
+        if self._inside_option:
+            self._option_chunks.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "option" and self._inside_option:
+            self._finish_option()
+            return
+        if tag == "select" and self._inside_semester_select:
+            self._inside_semester_select = False
+
+    def _finish_option(self) -> None:
+        option_attrs = dict(self._option_attrs)
+        raw_value = option_attrs.get("value")
+        raw_title = unescape("".join(self._option_chunks).strip())
+        self._inside_option = False
+        self._option_attrs = {}
+        self._option_chunks = []
+
+        if raw_value is None or raw_title == "":
+            return
+
+        try:
+            semester_id = int(raw_value)
+        except ValueError:
+            return
+
+        match = _SEMESTER_SHORT_NAME_PATTERN.match(raw_title)
+        short_name = match.group("short") if match else None
+        self.periods.append(
+            StudyPeriod(
+                semester_id=semester_id,
+                title=raw_title,
+                short_name=short_name,
+                active=("selected" in option_attrs),
+            )
+        )
+
+
 class RTUScheduleClient:
     """Client for the RTU public schedule endpoints."""
 
@@ -39,12 +115,18 @@ class RTUScheduleClient:
         self.settings = settings
         self.session: Session = requests.Session()
         self._bootstrap_complete = False
+        self._homepage_html: str | None = None
         self._session_lock = Lock()
         self._cache_lock = Lock()
-        self._courses_cache: list[int] | None = None
-        self._groups_cache: dict[str, ResolvedSemesterProgram] | None = None
+        self._study_periods_cache: list[StudyPeriod] | None = None
+        self._study_period_details_cache: dict[int, StudyPeriod] = {}
+        self._departments_cache: dict[int, list[StudyDepartment]] = {}
+        self._programs_cache: dict[int, list[StudyProgram]] = {}
+        self._program_families_cache: dict[tuple[int, str], list[StudyProgramFamily]] = {}
+        self._courses_cache: dict[tuple[int, int], list[int]] = {}
+        self._groups_cache: dict[tuple[int, int, int], list[ResolvedSemesterProgram]] = {}
         self._published_cache: dict[int, bool] = {}
-        self._resolved_targets: dict[str, ResolvedSemesterProgram] = {}
+        self._resolved_targets: dict[tuple[int, int, int, str, int | None], ResolvedSemesterProgram] = {}
 
         retry = Retry(
             total=settings.request_retries,
@@ -71,68 +153,230 @@ class RTUScheduleClient:
         """Close the underlying requests session."""
         self.session.close()
 
-    def _timeout(self) -> tuple[int, int]:
-        return (
-            self.settings.request_connect_timeout_seconds,
-            self.settings.request_timeout_seconds,
+    def get_study_periods(self) -> list[StudyPeriod]:
+        """Return all study periods shown on the RTU homepage."""
+        with self._cache_lock:
+            if self._study_periods_cache is not None:
+                return list(self._study_periods_cache)
+
+        parser = _StudyPeriodParser()
+        parser.feed(self._get_homepage_html())
+        periods = parser.periods
+        if not periods:
+            raise RTUAPIError("Unable to parse study periods from the RTU homepage")
+
+        with self._cache_lock:
+            self._study_periods_cache = list(periods)
+        return periods
+
+    def get_study_period_details(self, semester_id: int) -> StudyPeriod:
+        """Return detailed information for one study period."""
+        with self._cache_lock:
+            cached = self._study_period_details_cache.get(semester_id)
+        if cached is not None:
+            return cached
+
+        payload = self._post_form("getChousenSemesterStartEndDate", {"semesterId": semester_id})
+        if not isinstance(payload, dict):
+            raise RTUAPIError("Unexpected response from getChousenSemesterStartEndDate")
+
+        title = self._prefer_language(payload, "titleEN", "titleLV")
+        short_name = self._prefer_language(payload, "shortNameEN", "shortNameLV", fallback="") or None
+        period = StudyPeriod(
+            semester_id=int(payload.get("semesterId", semester_id)),
+            title=self._compose_study_period_title(title, short_name),
+            short_name=short_name,
+            start_date=self._parse_date(payload.get("startDate")) if payload.get("startDate") is not None else None,
+            end_date=self._parse_date(payload.get("endDate")) if payload.get("endDate") is not None else None,
+            active=bool(payload.get("active")),
+        )
+        with self._cache_lock:
+            self._study_period_details_cache[semester_id] = period
+        return period
+
+    def get_departments(self, semester_id: int) -> list[StudyDepartment]:
+        """Return departments that contain study programs for the given study period."""
+        _, departments = self._load_programs_and_departments(semester_id)
+        return departments
+
+    def get_locked_study_period(self) -> StudyPeriod:
+        """Return the study period that the bot is locked to."""
+        period = self.get_study_period_details(self.settings.rtu_semester_id)
+        if period.title != self.settings.rtu_semester_title:
+            LOGGER.warning(
+                "Locked semester title differs from RTU response: configured=%s actual=%s",
+                self.settings.rtu_semester_title,
+                period.title,
+            )
+        LOGGER.info(
+            "Using locked study period: semester_id=%s title=%s",
+            period.semester_id,
+            period.title,
+        )
+        return period
+
+    def get_locked_department(self, semester_id: int | None = None) -> StudyDepartment:
+        """Return the Foreign Students department for the locked semester."""
+        resolved_semester_id = semester_id or self.settings.rtu_semester_id
+        departments = self.get_departments(resolved_semester_id)
+        for department in departments:
+            if department.code == self.settings.rtu_department_code:
+                LOGGER.info(
+                    "Using locked department: semester_id=%s department_id=%s department=%s (%s)",
+                    resolved_semester_id,
+                    department.department_id,
+                    department.title,
+                    department.code,
+                )
+                return department
+        raise RTUAPIError(
+            f"Department {self.settings.rtu_department_code} was not found in semester {resolved_semester_id}"
         )
 
-    def _bootstrap(self) -> None:
-        """Prime the session before POST requests."""
-        if self._bootstrap_complete:
-            return
+    def get_study_programs(self, semester_id: int) -> list[StudyProgram]:
+        """Return study programs for the given study period."""
+        programs, _ = self._load_programs_and_departments(semester_id)
+        return programs
 
-        url = f"{self.settings.rtu_base_url}/?lang={self.settings.rtu_lang}"
-        LOGGER.debug("Bootstrapping RTU session via %s", url)
-        try:
-            response = self.session.get(url, timeout=self._timeout())
-            response.raise_for_status()
-        except requests.RequestException as exc:
-            raise RTUAPIError(f"Failed to bootstrap RTU session: {exc}") from exc
-        self._bootstrap_complete = True
+    def get_study_program(self, semester_id: int, program_id: int) -> StudyProgram | None:
+        """Return a single study program if it exists."""
+        for program in self.get_study_programs(semester_id):
+            if program.program_id == program_id:
+                return program
+        return None
 
-    def _post_form(self, path: str, form_data: dict[str, str | int]) -> Any:
-        """Send a form-encoded POST request and return parsed JSON."""
-        try:
-            with self._session_lock:
-                self._bootstrap()
-                url = f"{self.settings.rtu_base_url}/{path.lstrip('/')}"
-                LOGGER.debug("POST %s with payload %s", url, form_data)
-                response = self.session.post(url, data=form_data, timeout=self._timeout())
-        except requests.RequestException as exc:
-            raise RTUAPIError(f"RTU API request failed for {path}: {exc}") from exc
+    def get_courses(self, semester_id: int, program_id: int) -> list[int]:
+        """Return available course numbers for a study program."""
+        cache_key = (semester_id, program_id)
+        with self._cache_lock:
+            cached = self._courses_cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
 
-        return self._handle_json_response(response, path)
-
-    @staticmethod
-    def _handle_json_response(response: Response, path: str) -> Any:
-        try:
-            response.raise_for_status()
-        except requests.HTTPError as exc:
-            raise RTUAPIError(f"RTU API request failed for {path}: {exc}") from exc
-
-        try:
-            return response.json()
-        except ValueError as exc:
-            raise RTUAPIError(f"RTU API returned invalid JSON for {path}") from exc
-
-    def find_courses_by_program_id(self, semester_id: int, program_id: int) -> list[int]:
-        """Return the available course IDs for a program."""
         payload = self._post_form(
             "findCourseByProgramId",
             {"semesterId": semester_id, "programId": program_id},
         )
         if not isinstance(payload, list):
             raise RTUAPIError("Unexpected response from findCourseByProgramId")
-        return [int(item) for item in payload]
 
-    def find_groups_by_course_id(
+        courses: list[int] = []
+        for item in payload:
+            try:
+                courses.append(int(item))
+            except (TypeError, ValueError):
+                LOGGER.warning(
+                    "Skipping malformed RTU course item for semester_id=%s program_id=%s: %r",
+                    semester_id,
+                    program_id,
+                    item,
+                )
+
+        courses = sorted(set(courses))
+        with self._cache_lock:
+            self._courses_cache[cache_key] = list(courses)
+        return courses
+
+    def get_program_families(
+        self,
+        semester_id: int,
+        department_code: str,
+    ) -> list[StudyProgramFamily]:
+        """Return deduplicated program families for one department."""
+        cache_key = (semester_id, department_code)
+        with self._cache_lock:
+            cached = self._program_families_cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
+
+        programs = [
+            program
+            for program in self.get_study_programs(semester_id)
+            if program.department_code == department_code
+        ]
+        LOGGER.debug(
+            "Raw RTU program rows: semester_id=%s department_code=%s rows=%s",
+            semester_id,
+            department_code,
+            [
+                f"{program.program_id}:{self._normalize_program_family_title(program.title)} ({program.code or 'no-code'})"
+                for program in programs
+            ],
+        )
+        if not programs:
+            raise RTUAPIError(
+                f"No study programs were returned for department {department_code} in semester {semester_id}"
+            )
+
+        grouped: dict[str, list[StudyProgram]] = {}
+        for program in programs:
+            family_key = self._program_family_key(program.title)
+            grouped.setdefault(family_key, []).append(program)
+
+        families: list[StudyProgramFamily] = []
+        for family_key, variants in grouped.items():
+            display_name = self._choose_program_family_display_name(variants)
+            representative = self._choose_representative_program(semester_id, variants)
+            families.append(
+                StudyProgramFamily(
+                    family_key=family_key,
+                    display_name=display_name,
+                    representative_program=representative,
+                    variants=tuple(
+                        sorted(
+                            variants,
+                            key=lambda item: (self._normalize_program_family_title(item.title), item.program_id),
+                        )
+                    ),
+                )
+            )
+
+        families = sorted(families, key=lambda item: item.display_name.casefold())
+        LOGGER.debug(
+            "Grouped RTU program families: semester_id=%s department_code=%s groups=%s",
+            semester_id,
+            department_code,
+            [
+                (
+                    family.display_name,
+                    [
+                        f"{program.program_id}:{program.code or 'no-code'}"
+                        for program in family.variants
+                    ],
+                    f"{family.representative_program.program_id}:{family.representative_program.code or 'no-code'}",
+                )
+                for family in families
+            ],
+        )
+        with self._cache_lock:
+            self._program_families_cache[cache_key] = list(families)
+        return families
+
+    def get_program_family_by_representative_id(
+        self,
+        semester_id: int,
+        department_code: str,
+        representative_program_id: int,
+    ) -> StudyProgramFamily | None:
+        """Return one deduplicated program family by its representative program ID."""
+        for family in self.get_program_families(semester_id, department_code):
+            if family.representative_program.program_id == representative_program_id:
+                return family
+        return None
+
+    def get_groups(
         self,
         semester_id: int,
         program_id: int,
         course_id: int,
     ) -> list[ResolvedSemesterProgram]:
-        """Return the available groups for a course."""
+        """Return available groups for a study program course."""
+        cache_key = (semester_id, program_id, course_id)
+        with self._cache_lock:
+            cached = self._groups_cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
+
         payload = self._post_form(
             "findGroupByCourseId",
             {
@@ -148,20 +392,155 @@ class RTUScheduleClient:
         for item in payload:
             if not isinstance(item, dict):
                 continue
-            program = item.get("program") or {}
-            results.append(
-                ResolvedSemesterProgram(
-                    semester_program_id=int(item["semesterProgramId"]),
-                    semester_id=int(item["semesterId"]),
-                    program_id=int(item["programId"]),
-                    course_id=int(item["course"]),
-                    group=str(item["group"]),
-                    program_code=program.get("code"),
-                    program_title=program.get("titleEN") or program.get("titleLV"),
-                    published=True,
+            try:
+                program_payload = item.get("program") or {}
+                results.append(
+                    ResolvedSemesterProgram(
+                        semester_program_id=int(item["semesterProgramId"]),
+                        semester_id=int(item.get("semesterId", semester_id)),
+                        program_id=int(item.get("programId", program_id)),
+                        course_id=int(item.get("course", course_id)),
+                        group=str(item.get("group") or "").strip(),
+                        program_code=program_payload.get("code"),
+                        program_title=(
+                            program_payload.get("titleEN")
+                            or program_payload.get("titleLV")
+                            or None
+                        ),
+                        published=None,
+                    )
                 )
-            )
+            except (KeyError, TypeError, ValueError):
+                LOGGER.warning(
+                    "Skipping malformed RTU group item for semester_id=%s program_id=%s course_id=%s: %r",
+                    semester_id,
+                    program_id,
+                    course_id,
+                    item,
+                )
+
+        results = sorted(
+            results,
+            key=lambda item: (self._group_sort_key(item.group), item.semester_program_id),
+        )
+        with self._cache_lock:
+            self._groups_cache[cache_key] = list(results)
         return results
+
+    def get_display_groups(
+        self,
+        semester_id: int,
+        program_id: int,
+        course_id: int,
+    ) -> list[ResolvedSemesterProgram]:
+        """Return filtered groups suitable for Telegram selection."""
+        raw_groups = self.get_groups(semester_id, program_id, course_id)
+        LOGGER.debug(
+            "Loaded raw RTU groups: semester_id=%s program_id=%s course_id=%s groups=%s",
+            semester_id,
+            program_id,
+            course_id,
+            [(group.group, group.semester_program_id) for group in raw_groups],
+        )
+        filtered_groups = [
+            group for group in raw_groups if self._is_display_group(group.group)
+        ]
+        if not filtered_groups:
+            filtered_groups = list(raw_groups)
+        else:
+            visible_numbers = [
+                number
+                for number in (self._parse_group_number(group.group) for group in filtered_groups)
+                if number is not None
+            ]
+            contiguous_visible_groups = self._contiguous_prefix_length(visible_numbers)
+            if 2 <= contiguous_visible_groups < len(visible_numbers):
+                allowed_numbers = set(range(1, contiguous_visible_groups + 1))
+                filtered_groups = [
+                    group
+                    for group in filtered_groups
+                    if self._parse_group_number(group.group) in allowed_numbers
+                ]
+                LOGGER.debug(
+                    "Applied contiguous prefix group filter: semester_id=%s program_id=%s course_id=%s prefix=%s",
+                    semester_id,
+                    program_id,
+                    course_id,
+                    contiguous_visible_groups,
+                )
+
+        filtered_groups = sorted(
+            filtered_groups,
+            key=lambda item: (self._group_sort_key(item.group), item.semester_program_id),
+        )
+        LOGGER.debug(
+            "Filtered RTU groups: semester_id=%s program_id=%s course_id=%s groups=%s",
+            semester_id,
+            program_id,
+            course_id,
+            [(group.group, group.semester_program_id) for group in filtered_groups],
+        )
+        return filtered_groups
+
+    def resolve_chat_selection(self, selection: ChatSelection) -> ResolvedSemesterProgram:
+        """Resolve a saved chat selection into an active semester program target."""
+        if not selection.is_complete():
+            raise RTUResolutionError("Saved selection is incomplete")
+
+        return self.resolve_semester_program(
+            semester_id=selection.semester_id,
+            program_id=selection.program_id,
+            course_id=selection.course_id,
+            group=selection.selected_group,
+            semester_program_id=selection.semester_program_id,
+        )
+
+    def resolve_semester_program(
+        self,
+        semester_id: int | None,
+        program_id: int | None,
+        course_id: int | None,
+        group: str | None = None,
+        semester_program_id: int | None = None,
+    ) -> ResolvedSemesterProgram:
+        """Resolve a semester program from a study period, program, course, and group."""
+        if semester_id is None or program_id is None or course_id is None:
+            raise RTUResolutionError("Study period, study program, and course are required")
+
+        normalized_group = str(group or "").strip()
+        if not normalized_group and semester_program_id is None:
+            raise RTUResolutionError("Group is required")
+
+        cache_key = (semester_id, program_id, course_id, normalized_group, semester_program_id)
+        with self._cache_lock:
+            cached = self._resolved_targets.get(cache_key)
+        if cached is not None:
+            return cached
+
+        courses = self.get_courses(semester_id, program_id)
+        if course_id not in courses:
+            raise RTUResolutionError(
+                f"Course {course_id} is not available for program {program_id} in study period {semester_id}"
+            )
+
+        groups = self.get_groups(semester_id, program_id, course_id)
+        target = self._find_group_target(groups, normalized_group, semester_program_id)
+        if target is None:
+            lookup = f"semesterProgramId {semester_program_id}" if semester_program_id is not None else normalized_group
+            raise RTUResolutionError(
+                f"Group {lookup} was not found for course {course_id}, study period {semester_id}, program {program_id}"
+            )
+
+        if not self.is_semester_program_published(target.semester_program_id):
+            raise RTUPublicationError(
+                "Schedule is not published for "
+                f"{target.program_title or 'the selected program'}, course {target.course_id}, group {target.group}"
+            )
+
+        resolved = replace(target, published=True)
+        with self._cache_lock:
+            self._resolved_targets[cache_key] = resolved
+        return resolved
 
     def is_semester_program_published(self, semester_program_id: int) -> bool:
         """Return whether the semester program is published."""
@@ -198,62 +577,18 @@ class RTUScheduleClient:
         for item in payload:
             if not isinstance(item, dict):
                 continue
-            subjects.append(
-                Subject(
-                    subject_id=int(item["subjectId"]),
-                    code=str(item.get("code") or ""),
-                    title=str(item.get("titleEN") or item.get("titleLV") or ""),
-                    part=int(item["part"]) if item.get("part") is not None else None,
+            try:
+                subjects.append(
+                    Subject(
+                        subject_id=int(item["subjectId"]),
+                        code=str(item.get("code") or ""),
+                        title=str(item.get("titleEN") or item.get("titleLV") or ""),
+                        part=int(item["part"]) if item.get("part") is not None else None,
+                    )
                 )
-            )
+            except (KeyError, TypeError, ValueError):
+                LOGGER.warning("Skipping malformed RTU subject item: %r", item)
         return sorted(subjects, key=lambda subject: (subject.code, subject.title))
-
-    def resolve_semester_program(self, group: str) -> ResolvedSemesterProgram:
-        """Resolve the semester program ID for a selected group."""
-        normalized_group = str(group).strip()
-        if not normalized_group:
-            raise RTUResolutionError("Group is empty")
-
-        with self._cache_lock:
-            cached = self._resolved_targets.get(normalized_group)
-        if cached is not None:
-            return cached
-
-        courses = self._get_courses()
-        if self.settings.rtu_course_id not in courses:
-            raise RTUResolutionError(
-                f"Course {self.settings.rtu_course_id} is not available for program "
-                f"{self.settings.rtu_program_id} in semester {self.settings.rtu_semester_id}"
-            )
-
-        groups = self._get_groups()
-        target = groups.get(normalized_group)
-        if target is None:
-            raise RTUResolutionError(
-                f"Group {normalized_group} was not found for course "
-                f"{self.settings.rtu_course_id}, semester {self.settings.rtu_semester_id}, "
-                f"program {self.settings.rtu_program_id}"
-            )
-
-        published = self.is_semester_program_published(target.semester_program_id)
-        if not published:
-            raise RTUPublicationError(
-                f"semesterProgramId {target.semester_program_id} for group {normalized_group} is not published"
-            )
-
-        resolved = ResolvedSemesterProgram(
-            semester_program_id=target.semester_program_id,
-            semester_id=target.semester_id,
-            program_id=target.program_id,
-            course_id=target.course_id,
-            group=target.group,
-            program_code=target.program_code,
-            program_title=target.program_title,
-            published=True,
-        )
-        with self._cache_lock:
-            self._resolved_targets[normalized_group] = resolved
-        return resolved
 
     def get_month_events(self, semester_program_id: int, year: int, month: int) -> list[ScheduleEvent]:
         """Fetch normalized events for a single calendar month."""
@@ -292,33 +627,312 @@ class RTUScheduleClient:
         ]
         return sorted(filtered, key=lambda event: event.sort_key())
 
-    def _get_courses(self) -> list[int]:
-        with self._cache_lock:
-            if self._courses_cache is not None:
-                return list(self._courses_cache)
-
-        courses = self.find_courses_by_program_id(
-            semester_id=self.settings.rtu_semester_id,
-            program_id=self.settings.rtu_program_id,
+    def _timeout(self) -> tuple[int, int]:
+        return (
+            self.settings.request_connect_timeout_seconds,
+            self.settings.request_timeout_seconds,
         )
-        with self._cache_lock:
-            self._courses_cache = list(courses)
-        return courses
 
-    def _get_groups(self) -> dict[str, ResolvedSemesterProgram]:
-        with self._cache_lock:
-            if self._groups_cache is not None:
-                return dict(self._groups_cache)
+    def _bootstrap(self) -> None:
+        """Prime the session before POST requests."""
+        if self._bootstrap_complete:
+            return
 
-        groups = self.find_groups_by_course_id(
-            semester_id=self.settings.rtu_semester_id,
-            program_id=self.settings.rtu_program_id,
-            course_id=self.settings.rtu_course_id,
+        url = f"{self.settings.rtu_base_url}/?lang={self.settings.rtu_lang}"
+        LOGGER.debug("Bootstrapping RTU session via %s", url)
+        try:
+            response = self.session.get(url, timeout=self._timeout())
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            raise RTUAPIError(f"Failed to bootstrap RTU session: {exc}") from exc
+
+        self._homepage_html = response.text
+        self._bootstrap_complete = True
+
+    def _get_homepage_html(self) -> str:
+        with self._session_lock:
+            self._bootstrap()
+            if self._homepage_html is None:
+                raise RTUAPIError("RTU homepage is unavailable")
+            return self._homepage_html
+
+    def _post_form(self, path: str, form_data: dict[str, str | int]) -> Any:
+        """Send a form-encoded POST request and return parsed JSON."""
+        try:
+            with self._session_lock:
+                self._bootstrap()
+                url = f"{self.settings.rtu_base_url}/{path.lstrip('/')}"
+                LOGGER.debug("POST %s with payload %s", url, form_data)
+                response = self.session.post(url, data=form_data, timeout=self._timeout())
+        except requests.RequestException as exc:
+            raise RTUAPIError(f"RTU API request failed for {path}: {exc}") from exc
+
+        return self._handle_json_response(response, path)
+
+    @staticmethod
+    def _handle_json_response(response: Response, path: str) -> Any:
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            raise RTUAPIError(f"RTU API request failed for {path}: {exc}") from exc
+
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise RTUAPIError(f"RTU API returned invalid JSON for {path}") from exc
+
+    def _load_programs_and_departments(
+        self,
+        semester_id: int,
+    ) -> tuple[list[StudyProgram], list[StudyDepartment]]:
+        with self._cache_lock:
+            cached_programs = self._programs_cache.get(semester_id)
+            cached_departments = self._departments_cache.get(semester_id)
+        if cached_programs is not None and cached_departments is not None:
+            return list(cached_programs), list(cached_departments)
+
+        payload = self._post_form("findProgramsBySemesterId", {"semesterId": semester_id})
+        if not isinstance(payload, list):
+            raise RTUAPIError("Unexpected response from findProgramsBySemesterId")
+
+        programs: list[StudyProgram] = []
+        departments: list[StudyDepartment] = []
+        for index, item in enumerate(payload):
+            if not isinstance(item, dict):
+                continue
+
+            department_id = self._parse_optional_int(item.get("departmentId"))
+            if department_id is None:
+                department_id = -(index + 1)
+
+            department_title = self._prefer_language(item, "titleEN", "titleLV")
+            department_code = str(item.get("code") or "").strip() or None
+            department_programs: list[StudyProgram] = []
+            for program_item in item.get("program") or []:
+                if not isinstance(program_item, dict):
+                    continue
+                try:
+                    department_programs.append(
+                        StudyProgram(
+                            program_id=int(program_item["programId"]),
+                            title=self._prefer_language(program_item, "titleEN", "titleLV"),
+                            code=str(program_item.get("code") or "").strip() or None,
+                            department_id=department_id,
+                            department_title=department_title,
+                            department_code=department_code,
+                        )
+                    )
+                except (KeyError, TypeError, ValueError):
+                    LOGGER.warning(
+                        "Skipping malformed RTU study program item for semester_id=%s: %r",
+                        semester_id,
+                        program_item,
+                    )
+
+            if not department_programs:
+                continue
+
+            departments.append(
+                StudyDepartment(
+                    department_id=department_id,
+                    title=department_title,
+                    code=department_code,
+                )
+            )
+            programs.extend(department_programs)
+
+        with self._cache_lock:
+            self._programs_cache[semester_id] = list(programs)
+            self._departments_cache[semester_id] = list(departments)
+        return programs, departments
+
+    def _choose_representative_program(
+        self,
+        semester_id: int,
+        variants: list[StudyProgram],
+    ) -> StudyProgram:
+        configured_match = next(
+            (program for program in variants if program.program_id == self.settings.rtu_program_id),
+            None,
         )
-        group_map = {item.group: item for item in groups}
-        with self._cache_lock:
-            self._groups_cache = dict(group_map)
-        return group_map
+        if configured_match is not None:
+            LOGGER.debug(
+                "Representative RTU program chosen from configured default: semester_id=%s family=%s representative=%s (%s)",
+                semester_id,
+                self._normalize_program_family_title(configured_match.title),
+                configured_match.program_id,
+                configured_match.code,
+            )
+            return configured_match
+
+        ranked = sorted(
+            variants,
+            key=lambda program: self._representative_sort_key(semester_id, program),
+        )
+        representative = ranked[0]
+        LOGGER.debug(
+            "Representative RTU program chosen: semester_id=%s family=%s representative=%s (%s)",
+            semester_id,
+            self._normalize_program_family_title(representative.title),
+            representative.program_id,
+            representative.code,
+        )
+        return representative
+
+    def _representative_sort_key(
+        self,
+        semester_id: int,
+        program: StudyProgram,
+    ) -> tuple[int, int, int, int, int]:
+        courses = self.get_courses(semester_id, program.program_id)
+        special_groups = 0
+        visible_groups = 0
+        contiguous_visible_groups = 0
+
+        for course_id in courses:
+            groups = self.get_groups(semester_id, program.program_id, course_id)
+            visible_numbers = [
+                number
+                for number in (self._parse_group_number(group.group) for group in groups)
+                if number is not None and self._is_display_group_number(number)
+            ]
+            visible_numbers = sorted(set(visible_numbers))
+            visible_groups += len(visible_numbers)
+            contiguous_visible_groups += self._contiguous_prefix_length(visible_numbers)
+            special_groups += len(groups) - len(
+                [
+                    group
+                    for group in groups
+                    if self._is_display_group(group.group)
+                ]
+            )
+
+        return (
+            -contiguous_visible_groups,
+            special_groups,
+            -visible_groups,
+            -len(courses),
+            program.program_id,
+        )
+
+    @staticmethod
+    def _find_group_target(
+        groups: list[ResolvedSemesterProgram],
+        normalized_group: str,
+        semester_program_id: int | None,
+    ) -> ResolvedSemesterProgram | None:
+        if semester_program_id is not None:
+            for candidate in groups:
+                if candidate.semester_program_id == semester_program_id:
+                    return candidate
+        if normalized_group:
+            for candidate in groups:
+                if candidate.group == normalized_group:
+                    return candidate
+        return None
+
+    @staticmethod
+    def _normalize_program_family_title(title: str) -> str:
+        cleaned = _WHITESPACE_PATTERN.sub(" ", str(title).strip())
+        cleaned = cleaned.replace(" ,", ",")
+        cleaned = re.sub(r"\s*,\s*", ", ", cleaned)
+        return cleaned.strip()
+
+    def _program_family_key(self, title: str) -> str:
+        return self._normalize_program_family_title(title).casefold()
+
+    def _choose_program_family_display_name(self, variants: list[StudyProgram]) -> str:
+        cleaned_titles = [self._normalize_program_family_title(item.title) for item in variants]
+        prettified = [self._prettify_program_family_title(title) for title in cleaned_titles]
+        return sorted(
+            prettified,
+            key=lambda title: (
+                -self._title_case_score(title),
+                len(title),
+                title.casefold(),
+            ),
+        )[0]
+
+    @staticmethod
+    def _prettify_program_family_title(title: str) -> str:
+        parts = title.split()
+        prettified: list[str] = []
+        for index, part in enumerate(parts):
+            word = part if part.isupper() else part.capitalize()
+            if index > 0 and word.lower().strip(",") in _SMALL_TITLE_WORDS:
+                if word.endswith(","):
+                    word = f"{word[:-1].lower()},"
+                else:
+                    word = word.lower()
+            prettified.append(word)
+        return " ".join(prettified)
+
+    @staticmethod
+    def _title_case_score(title: str) -> int:
+        score = 0
+        for word in title.split():
+            plain = word.strip(",")
+            if plain and plain[0].isupper():
+                score += 1
+        return score
+
+    @staticmethod
+    def _parse_group_number(group: str) -> int | None:
+        cleaned = str(group).strip()
+        if not cleaned.isdigit():
+            return None
+        return int(cleaned)
+
+    @classmethod
+    def _is_display_group_number(cls, number: int) -> bool:
+        return 1 <= number < 100 and number != 800
+
+    @classmethod
+    def _is_display_group(cls, group: str) -> bool:
+        number = cls._parse_group_number(group)
+        return number is not None and cls._is_display_group_number(number)
+
+    @classmethod
+    def _group_sort_key(cls, group: str) -> tuple[int, int, str]:
+        number = cls._parse_group_number(group)
+        if number is None:
+            return (2, 0, str(group))
+        if cls._is_display_group_number(number):
+            return (0, number, str(group))
+        return (1, number, str(group))
+
+    @staticmethod
+    def _contiguous_prefix_length(numbers: list[int]) -> int:
+        expected = 1
+        for number in numbers:
+            if number != expected:
+                break
+            expected += 1
+        return expected - 1
+
+    @staticmethod
+    def _compose_study_period_title(title: str, short_name: str | None) -> str:
+        if not short_name:
+            return title
+        if short_name in title:
+            return title
+        return f"{title} ({short_name})"
+
+    @staticmethod
+    def _prefer_language(
+        payload: dict[str, Any],
+        english_key: str,
+        local_key: str,
+        fallback: str = "",
+    ) -> str:
+        value = payload.get(english_key) or payload.get(local_key) or fallback
+        return str(value).strip()
+
+    @staticmethod
+    def _parse_optional_int(value: Any) -> int | None:
+        if value is None or value == "":
+            return None
+        return int(value)
 
     @staticmethod
     def _iter_year_months(start_date: date, end_date: date) -> list[tuple[int, int]]:
@@ -371,25 +985,9 @@ class RTUScheduleClient:
         except (KeyError, TypeError, ValueError) as exc:
             raise RTUAPIError(f"Failed to normalize RTU event payload: {exc}") from exc
 
-    @staticmethod
-    def _prefer_language(
-        payload: dict[str, Any],
-        english_key: str,
-        local_key: str,
-        fallback: str = "",
-    ) -> str:
-        value = payload.get(english_key) or payload.get(local_key) or fallback
-        return str(value).strip()
-
-    @staticmethod
-    def _parse_optional_int(value: Any) -> int | None:
-        if value is None or value == "":
-            return None
-        return int(value)
-
     def _parse_date(self, value: Any) -> date:
         if value is None:
-            raise RTUAPIError("Event is missing eventDate")
+            raise RTUAPIError("Value is missing a date")
         if isinstance(value, date) and not isinstance(value, datetime):
             return value
         if isinstance(value, datetime):
@@ -408,7 +1006,7 @@ class RTUScheduleClient:
             parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
             return self._to_local_datetime(parsed).date()
         except ValueError as exc:
-            raise RTUAPIError(f"Unable to parse eventDate: {raw}") from exc
+            raise RTUAPIError(f"Unable to parse date value: {raw}") from exc
 
     def _parse_time(self, value: Any, event_date: date) -> time | None:
         if value is None or value == "":

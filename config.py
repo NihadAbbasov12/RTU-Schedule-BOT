@@ -46,10 +46,13 @@ class Settings:
     telegram_chat_id: int | None = None
     rtu_base_url: str = "https://nodarbibas.rtu.lv"
     rtu_lang: str = "en"
+    # The bot is locked to the active Foreign Students semester/department.
     rtu_semester_id: int = 29
+    rtu_semester_title: str = "2025/2026 Spring semester (25/26-SP)"
+    rtu_department_code: str = "02A00"
+    rtu_department_title: str = "Foreign Students Department (02A00)"
     rtu_program_id: int = 1128
     rtu_course_id: int = 1
-    # Legacy values kept for one-time migration from older single-group deployments.
     rtu_group: str = "4"
     rtu_semester_program_id: int | None = None
     enable_scheduler: bool = True
@@ -85,6 +88,17 @@ class Settings:
             rtu_base_url=os.getenv("RTU_BASE_URL", "https://nodarbibas.rtu.lv").rstrip("/"),
             rtu_lang=os.getenv("RTU_LANG", "en").strip() or "en",
             rtu_semester_id=_parse_int(os.getenv("RTU_SEMESTER_ID"), 29) or 29,
+            rtu_semester_title=(
+                os.getenv("RTU_SEMESTER_TITLE", "2025/2026 Spring semester (25/26-SP)").strip()
+                or "2025/2026 Spring semester (25/26-SP)"
+            ),
+            rtu_department_code=(
+                os.getenv("RTU_DEPARTMENT_CODE", "02A00").strip() or "02A00"
+            ),
+            rtu_department_title=(
+                os.getenv("RTU_DEPARTMENT_TITLE", "Foreign Students Department (02A00)").strip()
+                or "Foreign Students Department (02A00)"
+            ),
             rtu_program_id=_parse_int(os.getenv("RTU_PROGRAM_ID"), 1128) or 1128,
             rtu_course_id=_parse_int(os.getenv("RTU_COURSE_ID"), 1) or 1,
             rtu_group=os.getenv("RTU_GROUP", "4").strip() or "4",
