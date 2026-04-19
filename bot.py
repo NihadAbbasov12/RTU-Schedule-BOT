@@ -7,7 +7,6 @@ import hashlib
 import logging
 from calendar import monthrange
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -40,6 +39,7 @@ from models import (
     ResolvedSemesterProgram,
     ScheduleDiff,
     ScheduleEvent,
+    SelectionDraft,
     StudyDepartment,
     StudyProgramFamily,
     combine_local_datetime,
@@ -72,28 +72,6 @@ SCHEDULE_REQUEST_ACTIONS = {"today", "tomorrow", "week", "month", "subjects", "r
 
 PROGRAM_PAGE_SIZE = 8
 SMALL_PAGE_SIZE = 8
-
-
-@dataclass(slots=True)
-class SelectionDraft:
-    """In-memory selection flow state for one Telegram chat."""
-
-    semester_id: int | None = None
-    semester_title: str | None = None
-    department_id: int | None = None
-    department_title: str | None = None
-    program_family: str | None = None
-    program_id: int | None = None
-    program_title: str | None = None
-    program_code: str | None = None
-    course_id: int | None = None
-
-    def clear_from_program(self) -> None:
-        self.program_family = None
-        self.program_id = None
-        self.program_title = None
-        self.program_code = None
-        self.course_id = None
 
 
 class ScheduleBotApp:
@@ -544,6 +522,14 @@ class ScheduleBotApp:
             await asyncio.to_thread(self.storage.touch_chat_activity, chat_id, False)
             action = parts[1]
             mode = parts[2]
+            identifier = parts[3] if len(parts) > 3 else None
+            LOGGER.info(
+                "Configuration callback received: chat_id=%s action=%s mode=%s identifier=%s",
+                chat_id,
+                action,
+                mode,
+                identifier,
+            )
 
             if action == "nav":
                 if mode == "back":
@@ -571,18 +557,37 @@ class ScheduleBotApp:
                 )
                 return
 
-            if chat_id not in self._selection_drafts:
+            draft = await self._get_selection_draft(chat_id)
+            if draft is None:
+                LOGGER.warning(
+                    "Selection draft missing for callback: chat_id=%s action=%s mode=%s identifier=%s",
+                    chat_id,
+                    action,
+                    mode,
+                    identifier,
+                )
                 await callback.answer("Setup expired. Starting over.")
                 await self._start_selection_prompt(
                     chat_id,
                     message=message,
                     intro_text=(
-                        "The previous setup expired.\n\n"
+                        "The previous setup could not be recovered.\n\n"
                         f"Study period: {self.settings.rtu_semester_title}\n"
                         f"Department: {self.settings.rtu_department_title}\n\n"
                         "Choose your program family again."
                     ),
                 )
+                return
+
+            if mode in {"page", "select"} and len(parts) < 4:
+                LOGGER.warning(
+                    "Configuration callback payload is incomplete: chat_id=%s action=%s mode=%s data=%s",
+                    chat_id,
+                    action,
+                    mode,
+                    data,
+                )
+                await callback.answer("That selection is no longer valid. Please try again.", show_alert=True)
                 return
 
             if mode == "page":
@@ -647,6 +652,33 @@ class ScheduleBotApp:
                 chat_id,
             )
             await self._send_text_safe(chat_id, fallback_message)
+
+    async def _get_selection_draft(self, chat_id: int) -> SelectionDraft | None:
+        draft = self._selection_drafts.get(chat_id)
+        if draft is not None:
+            return draft
+
+        draft = await asyncio.to_thread(self.storage.get_selection_draft, chat_id)
+        if draft is not None:
+            self._selection_drafts[chat_id] = draft
+            LOGGER.info("Recovered selection draft from SQLite for chat_id=%s", chat_id)
+        return draft
+
+    async def _save_selection_draft(self, chat_id: int, draft: SelectionDraft) -> None:
+        self._selection_drafts[chat_id] = draft
+        await asyncio.to_thread(self.storage.save_selection_draft, chat_id, draft)
+        LOGGER.debug(
+            "Saved selection draft: chat_id=%s semester_id=%s program_id=%s course_id=%s",
+            chat_id,
+            draft.semester_id,
+            draft.program_id,
+            draft.course_id,
+        )
+
+    async def _clear_selection_draft(self, chat_id: int) -> None:
+        self._selection_drafts.pop(chat_id, None)
+        await asyncio.to_thread(self.storage.delete_selection_draft, chat_id)
+        LOGGER.debug("Cleared selection draft for chat_id=%s", chat_id)
 
     async def _show_start(self, chat_id: int) -> None:
         selection = await asyncio.to_thread(self.storage.get_chat_selection, chat_id)
@@ -1422,6 +1454,7 @@ class ScheduleBotApp:
             department_id=department.department_id,
             department_title=department_title,
         )
+        await self._save_selection_draft(chat_id, self._selection_drafts[chat_id])
         LOGGER.info(
             "Starting locked selection flow: chat_id=%s semester_id=%s semester_title=%s department_id=%s department=%s",
             chat_id,
@@ -1447,7 +1480,7 @@ class ScheduleBotApp:
         await self._start_selection_prompt(chat_id, intro_text=reason)
 
     async def _cancel_configuration(self, chat_id: int, message: Message | None) -> None:
-        self._selection_drafts.pop(chat_id, None)
+        await self._clear_selection_draft(chat_id)
         current_selection = await asyncio.to_thread(self.storage.get_chat_selection, chat_id)
         text = "Setup cancelled. Use Change selection when you want to update the study selection."
         reply_markup = self._main_menu(chat_id) if current_selection is not None else ReplyKeyboardRemove()
@@ -1463,7 +1496,7 @@ class ScheduleBotApp:
         await self._send_text(chat_id, text, reply_markup=reply_markup)
 
     async def _navigate_back(self, chat_id: int, message: Message | None) -> None:
-        draft = self._selection_drafts.get(chat_id)
+        draft = await self._get_selection_draft(chat_id)
         if draft is None:
             await self._start_selection_prompt(
                 chat_id,
@@ -1474,11 +1507,13 @@ class ScheduleBotApp:
 
         if draft.course_id is not None:
             draft.course_id = None
+            await self._save_selection_draft(chat_id, draft)
             await self._show_course_prompt(chat_id, message=message)
             return
 
         if draft.program_id is not None:
             draft.clear_from_program()
+            await self._save_selection_draft(chat_id, draft)
             await self._show_program_prompt(chat_id, message=message)
             return
 
@@ -1505,7 +1540,7 @@ class ScheduleBotApp:
         page: int = 0,
         notice: str | None = None,
     ) -> None:
-        draft = self._selection_drafts.get(chat_id)
+        draft = await self._get_selection_draft(chat_id)
         if draft is None or draft.semester_id is None:
             await self._start_selection_prompt(
                 chat_id,
@@ -1557,7 +1592,7 @@ class ScheduleBotApp:
         page: int = 0,
         notice: str | None = None,
     ) -> None:
-        draft = self._selection_drafts.get(chat_id)
+        draft = await self._get_selection_draft(chat_id)
         if draft is None or draft.semester_id is None or draft.program_id is None:
             await self._show_program_prompt(
                 chat_id,
@@ -1606,7 +1641,7 @@ class ScheduleBotApp:
         page: int = 0,
         notice: str | None = None,
     ) -> None:
-        draft = self._selection_drafts.get(chat_id)
+        draft = await self._get_selection_draft(chat_id)
         if draft is None or draft.semester_id is None or draft.program_id is None or draft.course_id is None:
             await self._show_course_prompt(
                 chat_id,
@@ -1620,6 +1655,14 @@ class ScheduleBotApp:
             draft.semester_id,
             draft.program_id,
             draft.course_id,
+        )
+        LOGGER.info(
+            "Showing group prompt: chat_id=%s family=%s program_id=%s course_id=%s groups=%s",
+            chat_id,
+            draft.program_family,
+            draft.program_id,
+            draft.course_id,
+            [(group.group, group.semester_program_id) for group in groups],
         )
         if not groups:
             await self._show_course_prompt(
@@ -1655,7 +1698,7 @@ class ScheduleBotApp:
         program_id: int,
         message: Message | None,
     ) -> None:
-        draft = self._selection_drafts.get(chat_id)
+        draft = await self._get_selection_draft(chat_id)
         if draft is None or draft.semester_id is None:
             await self._start_selection_prompt(
                 chat_id,
@@ -1696,6 +1739,7 @@ class ScheduleBotApp:
         draft.program_code = representative.code
         draft.department_title = self.settings.rtu_department_title
         draft.course_id = None
+        await self._save_selection_draft(chat_id, draft)
 
         courses = await asyncio.to_thread(
             self.api_client.get_courses,
@@ -1712,6 +1756,7 @@ class ScheduleBotApp:
 
         if len(courses) == 1:
             draft.course_id = courses[0]
+            await self._save_selection_draft(chat_id, draft)
             groups = await asyncio.to_thread(
                 self.api_client.get_display_groups,
                 draft.semester_id,
@@ -1758,7 +1803,7 @@ class ScheduleBotApp:
         course_id: int,
         message: Message | None,
     ) -> None:
-        draft = self._selection_drafts.get(chat_id)
+        draft = await self._get_selection_draft(chat_id)
         if draft is None or draft.semester_id is None or draft.program_id is None:
             await self._show_program_prompt(
                 chat_id,
@@ -1781,6 +1826,7 @@ class ScheduleBotApp:
             return
 
         draft.course_id = course_id
+        await self._save_selection_draft(chat_id, draft)
         LOGGER.info(
             "Course selected: chat_id=%s family=%s program_id=%s course_id=%s",
             chat_id,
@@ -1826,6 +1872,15 @@ class ScheduleBotApp:
         semester_program_id: int,
         message: Message | None,
     ) -> None:
+        draft = await self._get_selection_draft(chat_id)
+        LOGGER.info(
+            "Group selected: chat_id=%s semester_program_id=%s family=%s program_id=%s course_id=%s",
+            chat_id,
+            semester_program_id,
+            draft.program_family if draft is not None else None,
+            draft.program_id if draft is not None else None,
+            draft.course_id if draft is not None else None,
+        )
         await self._complete_selection(chat_id, semester_program_id, message=message)
 
     async def _complete_selection(
@@ -1835,17 +1890,26 @@ class ScheduleBotApp:
         message: Message | None,
         notice: str | None = None,
     ) -> None:
-        draft = self._selection_drafts.get(chat_id)
+        draft = await self._get_selection_draft(chat_id)
         if (
             draft is None
             or draft.semester_id is None
             or draft.program_id is None
             or draft.course_id is None
         ):
+            LOGGER.warning(
+                "Selection completion fallback triggered because draft is incomplete: chat_id=%s semester_program_id=%s draft=%s",
+                chat_id,
+                semester_program_id,
+                draft,
+            )
             await self._show_program_prompt(
                 chat_id,
                 message=message,
-                notice="Choose your program family, course, and group first.",
+                notice=(
+                    "The final selection step could not be completed because the in-progress setup was incomplete. "
+                    "Choose your program family again."
+                ),
             )
             return
 
@@ -1860,10 +1924,22 @@ class ScheduleBotApp:
             None,
         )
         if group is None:
+            LOGGER.warning(
+                "Selected group was not found in current group list: chat_id=%s family=%s program_id=%s course_id=%s semester_program_id=%s groups=%s",
+                chat_id,
+                draft.program_family,
+                draft.program_id,
+                draft.course_id,
+                semester_program_id,
+                [(item.group, item.semester_program_id) for item in groups],
+            )
             await self._show_group_prompt(
                 chat_id,
                 message=message,
-                notice="That group is no longer available. Please choose another one.",
+                notice=(
+                    "That group is no longer available for the selected course. "
+                    "Please choose another group."
+                ),
             )
             return
 
@@ -1877,6 +1953,15 @@ class ScheduleBotApp:
                 semester_program_id,
             )
         except RTUPublicationError as exc:
+            LOGGER.warning(
+                "Selected group is unpublished: chat_id=%s family=%s course_id=%s group=%s semester_program_id=%s error=%s",
+                chat_id,
+                draft.program_family,
+                draft.course_id,
+                group.group,
+                semester_program_id,
+                exc,
+            )
             await self._show_group_prompt(
                 chat_id,
                 message=message,
@@ -1884,6 +1969,14 @@ class ScheduleBotApp:
             )
             return
         except RTUAPIError as exc:
+            LOGGER.exception(
+                "Failed to resolve selected group: chat_id=%s family=%s course_id=%s group=%s semester_program_id=%s",
+                chat_id,
+                draft.program_family,
+                draft.course_id,
+                group.group,
+                semester_program_id,
+            )
             await self._show_group_prompt(
                 chat_id,
                 message=message,
@@ -1913,8 +2006,35 @@ class ScheduleBotApp:
             semester_program_id=target.semester_program_id,
             department_title=draft.department_title or self.settings.rtu_department_title,
         )
-        await asyncio.to_thread(self.storage.save_chat_selection, selection)
-        self._selection_drafts.pop(chat_id, None)
+        try:
+            await asyncio.to_thread(self.storage.save_chat_selection, selection)
+        except Exception:
+            LOGGER.exception(
+                "Failed to save chat selection: chat_id=%s family=%s course_id=%s group=%s semester_program_id=%s",
+                chat_id,
+                selection.program_family,
+                selection.course_id,
+                selection.selected_group,
+                selection.semester_program_id,
+            )
+            await self._show_group_prompt(
+                chat_id,
+                message=message,
+                notice="I couldn't save the selected group right now. Please try again.",
+            )
+            return
+
+        saved_selection = await asyncio.to_thread(self.storage.get_chat_selection, chat_id)
+        LOGGER.info(
+            "Chat selection saved successfully: chat_id=%s family=%s course_id=%s group=%s semester_program_id=%s is_complete=%s",
+            chat_id,
+            selection.program_family,
+            selection.course_id,
+            selection.selected_group,
+            selection.semester_program_id,
+            saved_selection.is_complete() if saved_selection is not None else None,
+        )
+        await self._clear_selection_draft(chat_id)
 
         summary_lines = ["Selection saved."]
         if notice:
@@ -1934,6 +2054,7 @@ class ScheduleBotApp:
             "The main menu is ready below. Use Change selection whenever you want to switch program family, course, or group.",
             reply_markup=self._main_menu(chat_id),
         )
+        LOGGER.info("Main menu shown after successful selection completion: chat_id=%s", chat_id)
 
     def _build_setup_text(
         self,

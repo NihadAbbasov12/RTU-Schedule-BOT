@@ -44,6 +44,29 @@ class ChatSelection:
         )
 
 
+@dataclass(slots=True)
+class SelectionDraft:
+    """An in-progress per-chat selection draft."""
+
+    semester_id: int | None = None
+    semester_title: str | None = None
+    department_id: int | None = None
+    department_title: str | None = None
+    program_family: str | None = None
+    program_id: int | None = None
+    program_title: str | None = None
+    program_code: str | None = None
+    course_id: int | None = None
+
+    def clear_from_program(self) -> None:
+        """Reset the program-dependent portion of the draft."""
+        self.program_family = None
+        self.program_id = None
+        self.program_title = None
+        self.program_code = None
+        self.course_id = None
+
+
 @dataclass(slots=True, frozen=True)
 class StudyPeriod:
     """A study period shown on the RTU schedule website."""

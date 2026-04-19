@@ -11,7 +11,14 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
 
-from models import BotUsageStats, ChatSelection, ScheduleDiff, ScheduleEvent, iter_month_dates
+from models import (
+    BotUsageStats,
+    ChatSelection,
+    ScheduleDiff,
+    ScheduleEvent,
+    SelectionDraft,
+    iter_month_dates,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -91,6 +98,23 @@ class SnapshotStorage:
             )
             self.connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS selection_drafts (
+                    chat_id INTEGER PRIMARY KEY,
+                    semester_id INTEGER,
+                    semester_title TEXT,
+                    department_id INTEGER,
+                    department_title TEXT,
+                    program_family TEXT,
+                    program_id INTEGER,
+                    program_title TEXT,
+                    program_code TEXT,
+                    course_id INTEGER,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            self.connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS weekend_notifications (
                     chat_id INTEGER NOT NULL,
                     week_key TEXT NOT NULL,
@@ -126,6 +150,7 @@ class SnapshotStorage:
                 """
             )
             self._ensure_chat_preferences_columns()
+            self._ensure_selection_drafts_columns()
             self._ensure_chat_activity_columns()
             self.connection.commit()
             self._migrate_legacy_data()
@@ -160,6 +185,25 @@ class SnapshotStorage:
                 continue
             self.connection.execute(
                 f"ALTER TABLE chat_activity ADD COLUMN {column_name} {column_type} NOT NULL DEFAULT {default_sql}"
+            )
+
+    def _ensure_selection_drafts_columns(self) -> None:
+        columns = self._table_columns("selection_drafts")
+        for column_name, column_type in (
+            ("semester_id", "INTEGER"),
+            ("semester_title", "TEXT"),
+            ("department_id", "INTEGER"),
+            ("department_title", "TEXT"),
+            ("program_family", "TEXT"),
+            ("program_id", "INTEGER"),
+            ("program_title", "TEXT"),
+            ("program_code", "TEXT"),
+            ("course_id", "INTEGER"),
+        ):
+            if column_name in columns:
+                continue
+            self.connection.execute(
+                f"ALTER TABLE selection_drafts ADD COLUMN {column_name} {column_type}"
             )
 
     def _table_columns(self, table_name: str) -> set[str]:
@@ -359,6 +403,100 @@ class SnapshotStorage:
                     selection.selected_group,
                     selection.semester_program_id,
                 ),
+            )
+            self.connection.commit()
+
+    def save_selection_draft(self, chat_id: int, draft: SelectionDraft) -> None:
+        """Persist an in-progress selection draft for a chat."""
+        with self._lock:
+            self.connection.execute(
+                """
+                INSERT INTO selection_drafts (
+                    chat_id,
+                    semester_id,
+                    semester_title,
+                    department_id,
+                    department_title,
+                    program_family,
+                    program_id,
+                    program_title,
+                    program_code,
+                    course_id,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    semester_id = excluded.semester_id,
+                    semester_title = excluded.semester_title,
+                    department_id = excluded.department_id,
+                    department_title = excluded.department_title,
+                    program_family = excluded.program_family,
+                    program_id = excluded.program_id,
+                    program_title = excluded.program_title,
+                    program_code = excluded.program_code,
+                    course_id = excluded.course_id,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    chat_id,
+                    draft.semester_id,
+                    draft.semester_title,
+                    draft.department_id,
+                    draft.department_title,
+                    draft.program_family,
+                    draft.program_id,
+                    draft.program_title,
+                    draft.program_code,
+                    draft.course_id,
+                ),
+            )
+            self.connection.commit()
+
+    def get_selection_draft(self, chat_id: int) -> SelectionDraft | None:
+        """Load a persisted in-progress selection draft for a chat."""
+        with self._lock:
+            row = self.connection.execute(
+                """
+                SELECT
+                    semester_id,
+                    semester_title,
+                    department_id,
+                    department_title,
+                    program_family,
+                    program_id,
+                    program_title,
+                    program_code,
+                    course_id
+                FROM selection_drafts
+                WHERE chat_id = ?
+                """,
+                (chat_id,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        return SelectionDraft(
+            semester_id=int(row["semester_id"]) if row["semester_id"] is not None else None,
+            semester_title=row["semester_title"],
+            department_id=int(row["department_id"]) if row["department_id"] is not None else None,
+            department_title=row["department_title"],
+            program_family=row["program_family"],
+            program_id=int(row["program_id"]) if row["program_id"] is not None else None,
+            program_title=row["program_title"],
+            program_code=row["program_code"],
+            course_id=int(row["course_id"]) if row["course_id"] is not None else None,
+        )
+
+    def delete_selection_draft(self, chat_id: int) -> None:
+        """Delete the persisted in-progress selection draft for a chat."""
+        with self._lock:
+            self.connection.execute(
+                """
+                DELETE FROM selection_drafts
+                WHERE chat_id = ?
+                """,
+                (chat_id,),
             )
             self.connection.commit()
 
