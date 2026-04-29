@@ -26,6 +26,9 @@ from models import (
     StudyProgram,
     StudyProgramFamily,
     Subject,
+    clean_group_label,
+    infer_group_code,
+    normalize_group_code,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -33,6 +36,39 @@ _NUMERIC_PATTERN = re.compile(r"^-?\d+(?:\.\d+)?$")
 _SEMESTER_SHORT_NAME_PATTERN = re.compile(r"^(?P<title>.+?)\s*\((?P<short>[^()]+)\)$")
 _WHITESPACE_PATTERN = re.compile(r"\s+")
 _SMALL_TITLE_WORDS = {"and", "of", "in", "to", "for"}
+_PROGRAM_ID_FIELD_CANDIDATES = ("programId", "program_id", "id")
+_PROGRAM_CODE_FIELD_CANDIDATES = (
+    "code",
+    "programCode",
+    "program_code",
+    "studyProgramCode",
+    "study_program_code",
+    "shortName",
+    "short_name",
+)
+_PROGRAM_TITLE_FIELD_CANDIDATES = (
+    "titleEN",
+    "titleLV",
+    "title",
+    "name",
+    "programTitle",
+    "program_title",
+    "displayName",
+    "display_name",
+)
+_GROUP_CODE_FIELD_CANDIDATES = ("groupCode", "group_code", "code", "group", "name", "title")
+_GROUP_NAME_FIELD_CANDIDATES = (
+    "groupName",
+    "group_name",
+    "displayName",
+    "display_name",
+    "titleEN",
+    "titleLV",
+    "name",
+    "title",
+)
+_GROUP_ID_FIELD_CANDIDATES = ("groupId", "group_id", "id")
+_LOCKED_DEPARTMENT_CODE = "02A00"
 
 
 class RTUAPIError(RuntimeError):
@@ -126,7 +162,10 @@ class RTUScheduleClient:
         self._courses_cache: dict[tuple[int, int], list[int]] = {}
         self._groups_cache: dict[tuple[int, int, int], list[ResolvedSemesterProgram]] = {}
         self._published_cache: dict[int, bool] = {}
-        self._resolved_targets: dict[tuple[int, int, int, str, int | None], ResolvedSemesterProgram] = {}
+        self._resolved_targets: dict[
+            tuple[int, int, int, str, int | None, str | None, bool],
+            ResolvedSemesterProgram,
+        ] = {}
 
         retry = Retry(
             total=settings.request_retries,
@@ -220,7 +259,7 @@ class RTUScheduleClient:
         resolved_semester_id = semester_id or self.settings.rtu_semester_id
         departments = self.get_departments(resolved_semester_id)
         for department in departments:
-            if department.code == self.settings.rtu_department_code:
+            if (department.code or "").strip().casefold() == _LOCKED_DEPARTMENT_CODE.casefold():
                 LOGGER.info(
                     "Using locked department: semester_id=%s department_id=%s department=%s (%s)",
                     resolved_semester_id,
@@ -230,7 +269,7 @@ class RTUScheduleClient:
                 )
                 return department
         raise RTUAPIError(
-            f"Department {self.settings.rtu_department_code} was not found in semester {resolved_semester_id}"
+            f"Department {_LOCKED_DEPARTMENT_CODE} was not found in semester {resolved_semester_id}"
         )
 
     def get_study_programs(self, semester_id: int) -> list[StudyProgram]:
@@ -241,6 +280,114 @@ class RTUScheduleClient:
     def get_study_program(self, semester_id: int, program_id: int) -> StudyProgram | None:
         """Return a single study program if it exists."""
         for program in self.get_study_programs(semester_id):
+            if program.program_id == program_id:
+                return program
+        return None
+
+    def get_department_programs(
+        self,
+        semester_id: int,
+        department_code: str,
+    ) -> list[StudyProgram]:
+        """Return non-deduplicated RTU study programs for one department."""
+        requested_department_code = str(department_code).strip()
+        if requested_department_code.casefold() != _LOCKED_DEPARTMENT_CODE.casefold():
+            LOGGER.warning(
+                "Ignoring requested department_code=%s because this bot is locked to %s",
+                requested_department_code,
+                _LOCKED_DEPARTMENT_CODE,
+            )
+        normalized_department_code = _LOCKED_DEPARTMENT_CODE.casefold()
+        programs = [
+            program
+            for program in self.get_study_programs(semester_id)
+            if (program.department_code or "").strip().casefold() == normalized_department_code
+        ]
+        if not programs:
+            raise RTUAPIError(
+                f"No study programs were returned for department {_LOCKED_DEPARTMENT_CODE} in semester {semester_id}"
+            )
+
+        programs = sorted(
+            programs,
+            key=lambda program: (
+                self._normalize_program_family_title(program.title).casefold(),
+                (program.code or "").casefold(),
+                program.program_id,
+            ),
+        )
+        LOGGER.info(
+            "Fetched RTU program options: semester_id=%s department_code=%s count=%s",
+            semester_id,
+            department_code,
+            len(programs),
+        )
+        for program in programs:
+            LOGGER.debug(
+                "Program option prepared: title=%r code=%r id=%s",
+                program.title,
+                program.code,
+                program.program_id,
+            )
+        return programs
+
+    def get_department_program_titles(
+        self,
+        semester_id: int,
+        department_code: str,
+    ) -> list[str]:
+        """Return unique study program titles for one department, without RTU codes."""
+        titles_by_key: dict[str, str] = {}
+        for program in self.get_department_programs(semester_id, department_code):
+            normalized_title = self._normalize_program_family_title(program.title)
+            if not normalized_title:
+                continue
+            titles_by_key.setdefault(normalized_title.casefold(), normalized_title)
+
+        titles = sorted(titles_by_key.values(), key=lambda title: title.casefold())
+        LOGGER.info(
+            "Fetched RTU program title options: semester_id=%s department_code=%s count=%s titles=%s",
+            semester_id,
+            department_code,
+            len(titles),
+            titles,
+        )
+        return titles
+
+    def get_department_program_variants_by_title(
+        self,
+        semester_id: int,
+        department_code: str,
+        title: str,
+    ) -> list[StudyProgram]:
+        """Return exact RTU program variants for one selected display title."""
+        title_key = self._normalize_program_family_title(title).casefold()
+        variants = [
+            program
+            for program in self.get_department_programs(semester_id, department_code)
+            if self._normalize_program_family_title(program.title).casefold() == title_key
+        ]
+        variants = sorted(
+            variants,
+            key=lambda program: ((program.code or "").casefold(), program.program_id),
+        )
+        LOGGER.info(
+            "Fetched RTU program code variants: semester_id=%s department_code=%s title=%r variants=%s",
+            semester_id,
+            department_code,
+            title,
+            [(program.code, program.program_id) for program in variants],
+        )
+        return variants
+
+    def get_department_program(
+        self,
+        semester_id: int,
+        department_code: str,
+        program_id: int,
+    ) -> StudyProgram | None:
+        """Return one exact RTU study program inside the selected department."""
+        for program in self.get_department_programs(semester_id, department_code):
             if program.program_id == program_id:
                 return program
         return None
@@ -364,6 +511,105 @@ class RTUScheduleClient:
                 return family
         return None
 
+    def get_program_family_by_program_id(
+        self,
+        semester_id: int,
+        department_code: str,
+        program_id: int,
+    ) -> StudyProgramFamily | None:
+        """Return one deduplicated program family by any program ID contained in it."""
+        for family in self.get_program_families(semester_id, department_code):
+            if any(variant.program_id == program_id for variant in family.variants):
+                return family
+        return None
+
+    def get_family_courses(
+        self,
+        semester_id: int,
+        program_id: int,
+        *,
+        program_family: str | None = None,
+        department_code: str | None = None,
+    ) -> list[int]:
+        """Return all available course numbers across the selected program family."""
+        family = self._resolve_program_family(
+            semester_id=semester_id,
+            program_id=program_id,
+            program_family=program_family,
+            department_code=department_code,
+        )
+        if family is None:
+            return self.get_courses(semester_id, program_id)
+
+        courses: set[int] = set()
+        for variant in self._ordered_family_variants(family, program_id):
+            courses.update(self.get_courses(semester_id, variant.program_id))
+
+        resolved_courses = sorted(courses)
+        LOGGER.debug(
+            "Loaded RTU family courses: semester_id=%s family=%s representative_program_id=%s courses=%s",
+            semester_id,
+            family.display_name,
+            family.representative_program.program_id,
+            resolved_courses,
+        )
+        return resolved_courses
+
+    def get_family_groups(
+        self,
+        semester_id: int,
+        program_id: int,
+        course_id: int,
+        *,
+        program_family: str | None = None,
+        department_code: str | None = None,
+    ) -> list[ResolvedSemesterProgram]:
+        """Return deduplicated groups across all variants in the selected program family."""
+        family = self._resolve_program_family(
+            semester_id=semester_id,
+            program_id=program_id,
+            program_family=program_family,
+            department_code=department_code,
+        )
+        if family is None:
+            return self.get_groups(semester_id, program_id, course_id)
+
+        groups_by_code: dict[str, ResolvedSemesterProgram] = {}
+        for variant in self._ordered_family_variants(family, program_id):
+            courses = self.get_courses(semester_id, variant.program_id)
+            if course_id not in courses:
+                continue
+
+            for group in self.get_groups(semester_id, variant.program_id, course_id):
+                group_code = group.normalized_group_code()
+                existing = groups_by_code.get(group_code)
+                if existing is None:
+                    groups_by_code[group_code] = group
+                    continue
+
+                LOGGER.debug(
+                    "Duplicate RTU group_code across family variants: semester_id=%s family=%s course_id=%s group_code=%s existing_program_id=%s replacement_program_id=%s",
+                    semester_id,
+                    family.display_name,
+                    course_id,
+                    group_code,
+                    existing.program_id,
+                    group.program_id,
+                )
+
+        resolved_groups = sorted(
+            groups_by_code.values(),
+            key=lambda item: (self._group_sort_key(item.group_code), item.semester_program_id),
+        )
+        LOGGER.debug(
+            "Loaded RTU family groups: semester_id=%s family=%s course_id=%s groups=%s",
+            semester_id,
+            family.display_name,
+            course_id,
+            [(group.group_code, group.group_name, group.program_id, group.semester_program_id) for group in resolved_groups],
+        )
+        return resolved_groups
+
     def get_groups(
         self,
         semester_id: int,
@@ -387,6 +633,15 @@ class RTUScheduleClient:
         )
         if not isinstance(payload, list):
             raise RTUAPIError("Unexpected response from findGroupByCourseId")
+        raw_example = next((item for item in payload if isinstance(item, dict)), None)
+        if raw_example is not None:
+            LOGGER.debug(
+                "Raw RTU group object example: semester_id=%s program_id=%s course_id=%s raw_group=%r",
+                semester_id,
+                program_id,
+                course_id,
+                raw_example,
+            )
 
         results: list[ResolvedSemesterProgram] = []
         for item in payload:
@@ -394,13 +649,21 @@ class RTUScheduleClient:
                 continue
             try:
                 program_payload = item.get("program") or {}
+                group_code, group_name, group_id, debug_fields = self._extract_group_metadata(
+                    item,
+                    semester_id=semester_id,
+                    program_id=program_id,
+                    course_id=course_id,
+                )
                 results.append(
                     ResolvedSemesterProgram(
                         semester_program_id=int(item["semesterProgramId"]),
                         semester_id=int(item.get("semesterId", semester_id)),
                         program_id=int(item.get("programId", program_id)),
                         course_id=int(item.get("course", course_id)),
-                        group=str(item.get("group") or "").strip(),
+                        group_code=group_code,
+                        group_name=group_name,
+                        group_id=group_id,
                         program_code=program_payload.get("code"),
                         program_title=(
                             program_payload.get("titleEN")
@@ -409,6 +672,20 @@ class RTUScheduleClient:
                         ),
                         published=None,
                     )
+                )
+                LOGGER.debug(
+                    "Parsed RTU group item: semester_id=%s program_id=%s course_id=%s semester_program_id=%s group_code=%s group_name=%s group_id=%s code_field=%s name_field=%s group_id_field=%s keys=%s",
+                    semester_id,
+                    program_id,
+                    course_id,
+                    item.get("semesterProgramId"),
+                    group_code,
+                    group_name,
+                    group_id,
+                    debug_fields.get("group_code_field"),
+                    debug_fields.get("group_name_field"),
+                    debug_fields.get("group_id_field"),
+                    sorted(item.keys()),
                 )
             except (KeyError, TypeError, ValueError):
                 LOGGER.warning(
@@ -421,7 +698,29 @@ class RTUScheduleClient:
 
         results = sorted(
             results,
-            key=lambda item: (self._group_sort_key(item.group), item.semester_program_id),
+            key=lambda item: (self._group_sort_key(item.group_code), item.semester_program_id),
+        )
+        LOGGER.info(
+            "Fetched RTU group list: semester_id=%s program_id=%s course_id=%s count=%s",
+            semester_id,
+            program_id,
+            course_id,
+            len(results),
+        )
+        LOGGER.debug(
+            "Fetched RTU groups detail: semester_id=%s program_id=%s course_id=%s groups=%s",
+            semester_id,
+            program_id,
+            course_id,
+            [
+                (
+                    group.group_code,
+                    group.group_name,
+                    group.group_id,
+                    group.semester_program_id,
+                )
+                for group in results
+            ],
         )
         with self._cache_lock:
             self._groups_cache[cache_key] = list(results)
@@ -432,25 +731,38 @@ class RTUScheduleClient:
         semester_id: int,
         program_id: int,
         course_id: int,
+        program_family: str | None = None,
+        *,
+        include_family_variants: bool = False,
     ) -> list[ResolvedSemesterProgram]:
         """Return filtered groups suitable for Telegram selection."""
-        raw_groups = self.get_groups(semester_id, program_id, course_id)
+        raw_groups = self._load_group_candidates(
+            semester_id=semester_id,
+            program_id=program_id,
+            course_id=course_id,
+            program_family=program_family,
+            include_family_variants=include_family_variants,
+        )
         LOGGER.debug(
-            "Loaded raw RTU groups: semester_id=%s program_id=%s course_id=%s groups=%s",
+            "Loaded raw RTU groups: semester_id=%s program_id=%s course_id=%s include_family_variants=%s groups=%s",
             semester_id,
             program_id,
             course_id,
-            [(group.group, group.semester_program_id) for group in raw_groups],
+            include_family_variants,
+            [(group.group_code, group.group_name, group.semester_program_id) for group in raw_groups],
         )
         filtered_groups = [
-            group for group in raw_groups if self._is_display_group(group.group)
+            group
+            for group in raw_groups
+            if self._parse_group_number(group.group_code) is None
+            or self._is_display_group(group.group_code)
         ]
         if not filtered_groups:
             filtered_groups = list(raw_groups)
-        else:
+        elif all(self._parse_group_number(group.group_code) is not None for group in filtered_groups):
             visible_numbers = [
                 number
-                for number in (self._parse_group_number(group.group) for group in filtered_groups)
+                for number in (self._parse_group_number(group.group_code) for group in filtered_groups)
                 if number is not None
             ]
             contiguous_visible_groups = self._contiguous_prefix_length(visible_numbers)
@@ -459,7 +771,7 @@ class RTUScheduleClient:
                 filtered_groups = [
                     group
                     for group in filtered_groups
-                    if self._parse_group_number(group.group) in allowed_numbers
+                    if self._parse_group_number(group.group_code) in allowed_numbers
                 ]
                 LOGGER.debug(
                     "Applied contiguous prefix group filter: semester_id=%s program_id=%s course_id=%s prefix=%s",
@@ -471,64 +783,183 @@ class RTUScheduleClient:
 
         filtered_groups = sorted(
             filtered_groups,
-            key=lambda item: (self._group_sort_key(item.group), item.semester_program_id),
+            key=lambda item: (self._group_sort_key(item.group_code), item.semester_program_id),
         )
         LOGGER.debug(
             "Filtered RTU groups: semester_id=%s program_id=%s course_id=%s groups=%s",
             semester_id,
             program_id,
             course_id,
-            [(group.group, group.semester_program_id) for group in filtered_groups],
+            [(group.group_code, group.group_name, group.semester_program_id) for group in filtered_groups],
         )
         return filtered_groups
 
     def resolve_chat_selection(self, selection: ChatSelection) -> ResolvedSemesterProgram:
         """Resolve a saved chat selection into an active semester program target."""
-        if not selection.is_complete():
+        if selection.semester_id is None or selection.program_id is None or selection.course_id is None:
             raise RTUResolutionError("Saved selection is incomplete")
 
-        return self.resolve_semester_program(
-            semester_id=selection.semester_id,
-            program_id=selection.program_id,
-            course_id=selection.course_id,
-            group=selection.selected_group,
-            semester_program_id=selection.semester_program_id,
+        resolved_group_code = selection.resolved_group_code()
+        LOGGER.info(
+            "Resolving saved selection: chat_id=%s semester_id=%s program_id=%s course_id=%s saved_group_code=%s saved_group=%s saved_semester_program_id=%s",
+            selection.chat_id,
+            selection.semester_id,
+            selection.program_id,
+            selection.course_id,
+            resolved_group_code or None,
+            selection.display_group(),
+            selection.semester_program_id,
         )
 
-    def resolve_semester_program(
+        if resolved_group_code:
+            return self.resolve_group_by_code(
+                semester_id=selection.semester_id,
+                program_id=selection.program_id,
+                course_id=selection.course_id,
+                group_code=resolved_group_code,
+                semester_program_id=selection.semester_program_id,
+                program_family=selection.program_family,
+                allow_family_fallback=self._allows_legacy_family_fallback(selection),
+            )
+
+        if selection.semester_program_id is not None:
+            LOGGER.warning(
+                "Saved selection is missing group_code; attempting semester_program_id fallback: chat_id=%s semester_id=%s program_id=%s course_id=%s semester_program_id=%s selected_group=%s",
+                selection.chat_id,
+                selection.semester_id,
+                selection.program_id,
+                selection.course_id,
+                selection.semester_program_id,
+                selection.selected_group,
+            )
+            return self._resolve_group_by_semester_program_id(
+                semester_id=selection.semester_id,
+                program_id=selection.program_id,
+                course_id=selection.course_id,
+                semester_program_id=selection.semester_program_id,
+                program_family=selection.program_family,
+            )
+
+        raise RTUResolutionError(
+            "Saved selection has no group_code and the legacy group value could not be recovered"
+        )
+
+    def resolve_group_by_code(
         self,
         semester_id: int | None,
         program_id: int | None,
         course_id: int | None,
-        group: str | None = None,
+        group_code: str | None,
         semester_program_id: int | None = None,
+        program_family: str | None = None,
+        allow_family_fallback: bool = True,
     ) -> ResolvedSemesterProgram:
-        """Resolve a semester program from a study period, program, course, and group."""
+        """Resolve a semester program from a study period, program, course, and stable RTU group code."""
         if semester_id is None or program_id is None or course_id is None:
             raise RTUResolutionError("Study period, study program, and course are required")
 
-        normalized_group = str(group or "").strip()
-        if not normalized_group and semester_program_id is None:
-            raise RTUResolutionError("Group is required")
+        normalized_group_code = normalize_group_code(group_code)
+        if not normalized_group_code:
+            raise RTUResolutionError("Group code is required")
 
-        cache_key = (semester_id, program_id, course_id, normalized_group, semester_program_id)
+        family_cache_key = self._program_family_key(program_family) if program_family else None
+        cache_key = (
+            semester_id,
+            program_id,
+            course_id,
+            normalized_group_code,
+            semester_program_id,
+            family_cache_key,
+            allow_family_fallback,
+        )
         with self._cache_lock:
             cached = self._resolved_targets.get(cache_key)
         if cached is not None:
             return cached
 
-        courses = self.get_courses(semester_id, program_id)
-        if course_id not in courses:
-            raise RTUResolutionError(
-                f"Course {course_id} is not available for program {program_id} in study period {semester_id}"
+        LOGGER.info(
+            "Resolving RTU group_code=%s for semester_id=%s program_id=%s course_id=%s saved_semester_program_id=%s program_family=%s allow_family_fallback=%s",
+            normalized_group_code,
+            semester_id,
+            program_id,
+            course_id,
+            semester_program_id,
+            program_family,
+            allow_family_fallback,
+        )
+
+        target: ResolvedSemesterProgram | None = None
+        available_group_codes: list[str] = []
+        exact_courses = self.get_courses(semester_id, program_id)
+        if course_id in exact_courses:
+            exact_groups = self.get_groups(semester_id, program_id, course_id)
+            available_group_codes = [group.group_code for group in exact_groups]
+            target = self._find_group_target(exact_groups, normalized_group_code, semester_program_id)
+            if target is None:
+                LOGGER.warning(
+                    "Exact RTU program lookup did not resolve group_code=%s for semester_id=%s program_id=%s course_id=%s available_group_codes=%s",
+                    normalized_group_code,
+                    semester_id,
+                    program_id,
+                    course_id,
+                    available_group_codes,
+                )
+        else:
+            LOGGER.warning(
+                "Exact RTU program lookup skipped because course_id=%s is not available for semester_id=%s program_id=%s exact_courses=%s",
+                course_id,
+                semester_id,
+                program_id,
+                exact_courses,
             )
 
-        groups = self.get_groups(semester_id, program_id, course_id)
-        target = self._find_group_target(groups, normalized_group, semester_program_id)
+        if target is None and allow_family_fallback:
+            courses = self.get_family_courses(
+                semester_id,
+                program_id,
+                program_family=program_family,
+                department_code=_LOCKED_DEPARTMENT_CODE,
+            )
+            if course_id not in courses:
+                raise RTUResolutionError(
+                    f"Course {course_id} is not available for program {program_id} in study period {semester_id}"
+                )
+
+            groups = self._load_group_candidates(
+                semester_id=semester_id,
+                program_id=program_id,
+                course_id=course_id,
+                program_family=program_family,
+                include_family_variants=True,
+            )
+            available_group_codes = [group.group_code for group in groups]
+            target = self._find_group_target(groups, normalized_group_code, semester_program_id)
+            if target is not None:
+                LOGGER.warning(
+                    "Resolved RTU group_code via family fallback: semester_id=%s program_id=%s course_id=%s group_code=%s semester_program_id=%s",
+                    semester_id,
+                    program_id,
+                    course_id,
+                    normalized_group_code,
+                    target.semester_program_id,
+                )
+
         if target is None:
-            lookup = f"semesterProgramId {semester_program_id}" if semester_program_id is not None else normalized_group
+            LOGGER.warning(
+                "Unable to resolve RTU group_code=%s for semester_id=%s program_id=%s course_id=%s allow_family_fallback=%s available_group_codes=%s",
+                normalized_group_code,
+                semester_id,
+                program_id,
+                course_id,
+                allow_family_fallback,
+                available_group_codes,
+            )
+            if not allow_family_fallback and course_id not in exact_courses:
+                raise RTUResolutionError(
+                    f"Course {course_id} is not available for exact program {program_id} in study period {semester_id}"
+                )
             raise RTUResolutionError(
-                f"Group {lookup} was not found for course {course_id}, study period {semester_id}, program {program_id}"
+                f"Group code {normalized_group_code} was not found for course {course_id}, study period {semester_id}, program {program_id}"
             )
 
         if not self.is_semester_program_published(target.semester_program_id):
@@ -541,6 +972,43 @@ class RTUScheduleClient:
         with self._cache_lock:
             self._resolved_targets[cache_key] = resolved
         return resolved
+
+    def resolve_semester_program(
+        self,
+        semester_id: int | None,
+        program_id: int | None,
+        course_id: int | None,
+        group: str | None = None,
+        semester_program_id: int | None = None,
+        program_family: str | None = None,
+    ) -> ResolvedSemesterProgram:
+        """Backward-compatible resolver that prefers normalized RTU group codes."""
+        normalized_group_code = normalize_group_code(group) or infer_group_code(group)
+        if normalized_group_code:
+            return self.resolve_group_by_code(
+                semester_id=semester_id,
+                program_id=program_id,
+                course_id=course_id,
+                group_code=normalized_group_code,
+                semester_program_id=semester_program_id,
+                program_family=program_family,
+            )
+        if semester_program_id is None:
+            raise RTUResolutionError("Group code is required")
+        if semester_id is None or program_id is None or course_id is None:
+            raise RTUResolutionError("Study period, study program, and course are required")
+        return self._resolve_group_by_semester_program_id(
+            semester_id=semester_id,
+            program_id=program_id,
+            course_id=course_id,
+            semester_program_id=semester_program_id,
+            program_family=program_family,
+        )
+
+    @staticmethod
+    def _allows_legacy_family_fallback(selection: ChatSelection) -> bool:
+        """Return whether a saved selection looks old enough to need family fallback."""
+        return not selection.program_code
 
     def is_semester_program_published(self, semester_program_id: int) -> bool:
         """Return whether the semester program is published."""
@@ -697,6 +1165,7 @@ class RTUScheduleClient:
 
         programs: list[StudyProgram] = []
         departments: list[StudyDepartment] = []
+        logged_program_example = False
         for index, item in enumerate(payload):
             if not isinstance(item, dict):
                 continue
@@ -711,16 +1180,38 @@ class RTUScheduleClient:
             for program_item in item.get("program") or []:
                 if not isinstance(program_item, dict):
                     continue
+                if not logged_program_example:
+                    LOGGER.debug(
+                        "Raw RTU program object example: semester_id=%s department_code=%s raw_program=%r",
+                        semester_id,
+                        department_code,
+                        program_item,
+                    )
+                    logged_program_example = True
                 try:
+                    parsed_program_id, parsed_title, parsed_code, debug_fields = self._extract_program_metadata(
+                        program_item
+                    )
                     department_programs.append(
                         StudyProgram(
-                            program_id=int(program_item["programId"]),
-                            title=self._prefer_language(program_item, "titleEN", "titleLV"),
-                            code=str(program_item.get("code") or "").strip() or None,
+                            program_id=parsed_program_id,
+                            title=parsed_title,
+                            code=parsed_code,
                             department_id=department_id,
                             department_title=department_title,
                             department_code=department_code,
                         )
+                    )
+                    LOGGER.debug(
+                        "Parsed RTU program item: semester_id=%s department_code=%s title=%r code=%r program_id=%s title_field=%s code_field=%s id_field=%s",
+                        semester_id,
+                        department_code,
+                        parsed_title,
+                        parsed_code,
+                        parsed_program_id,
+                        debug_fields.get("program_title_field"),
+                        debug_fields.get("program_code_field"),
+                        debug_fields.get("program_id_field"),
                     )
                 except (KeyError, TypeError, ValueError):
                     LOGGER.warning(
@@ -793,7 +1284,7 @@ class RTUScheduleClient:
             groups = self.get_groups(semester_id, program.program_id, course_id)
             visible_numbers = [
                 number
-                for number in (self._parse_group_number(group.group) for group in groups)
+                for number in (self._parse_group_number(group.group_code) for group in groups)
                 if number is not None and self._is_display_group_number(number)
             ]
             visible_numbers = sorted(set(visible_numbers))
@@ -803,7 +1294,7 @@ class RTUScheduleClient:
                 [
                     group
                     for group in groups
-                    if self._is_display_group(group.group)
+                    if self._is_display_group(group.group_code)
                 ]
             )
 
@@ -815,21 +1306,285 @@ class RTUScheduleClient:
             program.program_id,
         )
 
+    def _load_group_candidates(
+        self,
+        *,
+        semester_id: int,
+        program_id: int,
+        course_id: int,
+        program_family: str | None = None,
+        include_family_variants: bool = True,
+    ) -> list[ResolvedSemesterProgram]:
+        if include_family_variants:
+            family_groups = self.get_family_groups(
+                semester_id,
+                program_id,
+                course_id,
+                program_family=program_family,
+                department_code=_LOCKED_DEPARTMENT_CODE,
+            )
+            if family_groups:
+                return family_groups
+        return self.get_groups(semester_id, program_id, course_id)
+
+    def _resolve_program_family(
+        self,
+        *,
+        semester_id: int,
+        program_id: int,
+        program_family: str | None = None,
+        department_code: str | None = None,
+    ) -> StudyProgramFamily | None:
+        resolved_department_code = department_code or _LOCKED_DEPARTMENT_CODE
+        families = self.get_program_families(semester_id, resolved_department_code)
+        if program_family:
+            family_key = self._program_family_key(program_family)
+            for family in families:
+                if family.family_key == family_key:
+                    return family
+
+        by_representative = self.get_program_family_by_representative_id(
+            semester_id,
+            resolved_department_code,
+            program_id,
+        )
+        if by_representative is not None:
+            return by_representative
+
+        return self.get_program_family_by_program_id(
+            semester_id,
+            resolved_department_code,
+            program_id,
+        )
+
+    @staticmethod
+    def _ordered_family_variants(
+        family: StudyProgramFamily,
+        preferred_program_id: int,
+    ) -> tuple[StudyProgram, ...]:
+        return tuple(
+            sorted(
+                family.variants,
+                key=lambda variant: (0 if variant.program_id == preferred_program_id else 1, variant.program_id),
+            )
+        )
+
+    def _resolve_group_by_semester_program_id(
+        self,
+        semester_id: int,
+        program_id: int,
+        course_id: int,
+        semester_program_id: int,
+        program_family: str | None = None,
+    ) -> ResolvedSemesterProgram:
+        groups = self._load_group_candidates(
+            semester_id=semester_id,
+            program_id=program_id,
+            course_id=course_id,
+            program_family=program_family,
+        )
+        for candidate in groups:
+            if candidate.semester_program_id == semester_program_id:
+                if not self.is_semester_program_published(candidate.semester_program_id):
+                    raise RTUPublicationError(
+                        "Schedule is not published for "
+                        f"{candidate.program_title or 'the selected program'}, course {candidate.course_id}, group {candidate.group}"
+                    )
+                return replace(candidate, published=True)
+
+        LOGGER.warning(
+            "semester_program_id fallback failed for semester_id=%s program_id=%s course_id=%s semester_program_id=%s available_groups=%s",
+            semester_id,
+            program_id,
+            course_id,
+            semester_program_id,
+            [(group.group_code, group.semester_program_id) for group in groups],
+        )
+        raise RTUResolutionError(
+            f"semesterProgramId {semester_program_id} was not found for course {course_id}, study period {semester_id}, program {program_id}"
+        )
+
     @staticmethod
     def _find_group_target(
         groups: list[ResolvedSemesterProgram],
-        normalized_group: str,
+        normalized_group_code: str,
         semester_program_id: int | None,
     ) -> ResolvedSemesterProgram | None:
+        matches = [
+            candidate
+            for candidate in groups
+            if candidate.normalized_group_code() == normalized_group_code
+        ]
+        if not matches:
+            return None
+
         if semester_program_id is not None:
-            for candidate in groups:
+            for candidate in matches:
                 if candidate.semester_program_id == semester_program_id:
                     return candidate
-        if normalized_group:
-            for candidate in groups:
-                if candidate.group == normalized_group:
-                    return candidate
-        return None
+
+        if len(matches) > 1:
+            LOGGER.warning(
+                "Multiple RTU groups matched group_code=%s semester_program_id=%s candidates=%s",
+                normalized_group_code,
+                semester_program_id,
+                [(candidate.group_code, candidate.semester_program_id) for candidate in matches],
+            )
+        return matches[0]
+
+    def _extract_program_metadata(
+        self,
+        item: dict[str, Any],
+    ) -> tuple[int, str, str | None, dict[str, str | None]]:
+        program_id: int | None = None
+        program_id_field: str | None = None
+        for field_name in _PROGRAM_ID_FIELD_CANDIDATES:
+            raw_value = item.get(field_name)
+            try:
+                if raw_value not in (None, ""):
+                    program_id = int(raw_value)
+                    program_id_field = field_name
+                    break
+            except (TypeError, ValueError):
+                continue
+
+        if program_id is None:
+            raise ValueError("RTU program item is missing a valid program ID")
+
+        program_code: str | None = None
+        program_code_field: str | None = None
+        for field_name in _PROGRAM_CODE_FIELD_CANDIDATES:
+            raw_value = item.get(field_name)
+            if raw_value in (None, ""):
+                continue
+            candidate_code = str(raw_value).strip()
+            if candidate_code:
+                program_code = candidate_code
+                program_code_field = field_name
+                break
+
+        program_title: str | None = None
+        program_title_field: str | None = None
+        for field_name in _PROGRAM_TITLE_FIELD_CANDIDATES:
+            raw_value = item.get(field_name)
+            if raw_value in (None, ""):
+                continue
+            candidate_title = self._normalize_program_family_title(str(raw_value))
+            if candidate_title:
+                program_title = candidate_title
+                program_title_field = field_name
+                break
+
+        if not program_title and program_code:
+            program_title = program_code
+            program_title_field = program_code_field
+        if not program_title:
+            raise ValueError("RTU program item is missing a readable title")
+
+        return program_id, program_title, program_code, {
+            "program_id_field": program_id_field,
+            "program_code_field": program_code_field,
+            "program_title_field": program_title_field,
+        }
+
+    def _extract_group_metadata(
+        self,
+        item: dict[str, Any],
+        *,
+        semester_id: int,
+        program_id: int,
+        course_id: int,
+    ) -> tuple[str, str | None, int | None, dict[str, str | None]]:
+        group_payload = item.get("group")
+        candidate_values = self._collect_group_candidate_values(item, group_payload)
+
+        group_code: str | None = None
+        group_code_field: str | None = None
+        for field_name, raw_value in candidate_values["code"]:
+            candidate_code = infer_group_code(raw_value)
+            if candidate_code:
+                group_code = candidate_code
+                group_code_field = field_name
+                break
+
+        if not group_code:
+            LOGGER.warning(
+                "Skipping RTU group item without a resolvable group code: semester_id=%s program_id=%s course_id=%s keys=%s item=%r",
+                semester_id,
+                program_id,
+                course_id,
+                sorted(item.keys()),
+                item,
+            )
+            raise ValueError("RTU group item is missing a resolvable group code")
+
+        group_name: str | None = None
+        group_name_field: str | None = None
+        for field_name, raw_value in candidate_values["name"]:
+            candidate_name = clean_group_label(str(raw_value)) if raw_value not in (None, "") else None
+            if candidate_name:
+                group_name = candidate_name
+                group_name_field = field_name
+                break
+
+        if group_name is None:
+            raw_group_name = clean_group_label(group_payload if not isinstance(group_payload, dict) else None)
+            if raw_group_name:
+                group_name = raw_group_name
+                group_name_field = "group"
+
+        if group_name and normalize_group_code(group_name) == group_code:
+            group_name = None
+
+        group_id: int | None = None
+        group_id_field: str | None = None
+        for field_name, raw_value in candidate_values["id"]:
+            try:
+                if raw_value not in (None, ""):
+                    group_id = int(raw_value)
+                    group_id_field = field_name
+                    break
+            except (TypeError, ValueError):
+                continue
+
+        return group_code, group_name, group_id, {
+            "group_code_field": group_code_field,
+            "group_name_field": group_name_field,
+            "group_id_field": group_id_field,
+        }
+
+    @staticmethod
+    def _collect_group_candidate_values(
+        item: dict[str, Any],
+        group_payload: Any,
+    ) -> dict[str, list[tuple[str, Any]]]:
+        candidates: dict[str, list[tuple[str, Any]]] = {
+            "code": [],
+            "name": [],
+            "id": [],
+        }
+        for field_name in _GROUP_CODE_FIELD_CANDIDATES:
+            if field_name in item:
+                candidates["code"].append((field_name, item.get(field_name)))
+        for field_name in _GROUP_NAME_FIELD_CANDIDATES:
+            if field_name in item:
+                candidates["name"].append((field_name, item.get(field_name)))
+        for field_name in _GROUP_ID_FIELD_CANDIDATES:
+            if field_name in item:
+                candidates["id"].append((field_name, item.get(field_name)))
+
+        if isinstance(group_payload, dict):
+            for field_name in _GROUP_CODE_FIELD_CANDIDATES:
+                if field_name in group_payload:
+                    candidates["code"].append((f"group.{field_name}", group_payload.get(field_name)))
+            for field_name in _GROUP_NAME_FIELD_CANDIDATES:
+                if field_name in group_payload:
+                    candidates["name"].append((f"group.{field_name}", group_payload.get(field_name)))
+            for field_name in _GROUP_ID_FIELD_CANDIDATES:
+                if field_name in group_payload:
+                    candidates["id"].append((f"group.{field_name}", group_payload.get(field_name)))
+
+        return candidates
 
     @staticmethod
     def _normalize_program_family_title(title: str) -> str:
@@ -878,7 +1633,7 @@ class RTUScheduleClient:
 
     @staticmethod
     def _parse_group_number(group: str) -> int | None:
-        cleaned = str(group).strip()
+        cleaned = normalize_group_code(group)
         if not cleaned.isdigit():
             return None
         return int(cleaned)

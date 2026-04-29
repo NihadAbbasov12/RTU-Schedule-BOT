@@ -6,7 +6,7 @@ The bot is locked to the current Foreign Students setup and uses a simplified on
 
 - Study period: `2025/2026 Spring semester (25/26-SP)`
 - Department: `Foreign Students Department (02A00)`
-- User choice: `program family -> course -> group`
+- User choice: `program title -> exact RTU program code -> course -> group code`
 
 ## Features
 
@@ -27,19 +27,30 @@ When a user opens the bot and presses `/start`, the bot automatically uses:
 - `2025/2026 Spring semester (25/26-SP)`
 - `Foreign Students Department (02A00)`
 
-Then it shows deduplicated program-family buttons, for example:
+Then it shows unique program-title buttons without RTU codes, for example:
 
+- `Chemistry and Chemical Technology`
+- `Civil Construction and Real Estate Management`
+- `Civil Engineering`
+- `Computer Science`
 - `Computer Systems`
-- `Economics`
-- `Business Informatics`
-- `Entrepreneurship and Management`
+
+After the title is selected, the bot shows the exact RTU program-code variants for that title:
+
+- `ADBD0`
+- `ADMD0`
+- `ADBDW`
+- `ADMDW`
+
+Repeated program names with different RTU codes are intentionally separated into this second step to avoid Telegram button truncation and wrong automatic representative selection.
 
 After that:
 
-1. Choose the program family
-2. Choose the course if more than one course exists
-3. Choose the filtered group
-4. The bot saves the resolved selection and shows the main menu
+1. Choose the program title
+2. Choose the exact RTU program code
+3. Choose the course if more than one course exists
+4. Choose the group code for that exact program and course
+5. The bot saves the exact resolved selection and shows the main menu
 
 ## Main Menu
 
@@ -200,7 +211,7 @@ The bot stores:
 - `config.py` - environment loading
 - `formatter.py` - Telegram-friendly message formatting
 - `models.py` - typed domain models and date helpers
-- `rtu_api.py` - RTU API client, family grouping, course and group resolution
+- `rtu_api.py` - RTU API client, exact program listing, legacy family grouping, course and group resolution
 - `scheduler.py` - APScheduler integration
 - `storage.py` - SQLite storage for chat selections, reminders, stats, snapshots, and weekend notifications
 

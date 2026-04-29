@@ -96,16 +96,18 @@ def format_status(
     program_title: str | None,
     program_code: str | None,
     course_id: int | None,
-    group: str | None,
+    group_code: str | None,
+    group_name: str | None,
     semester_program_id: int | None,
     scheduler_enabled: bool,
     timezone: str,
 ) -> str:
     """Format the bot status message."""
-    selected_group = f"Group {group}" if group else "Not selected"
+    selected_group = _format_group_label(group_code, group_name)
     selected_period = semester_title or "Not selected"
     selected_department = department_title or "Not selected"
-    selected_family = program_family or "Not selected"
+    selected_family = program_family or program_title or "Not selected"
+    selected_program_code = program_code or "Not selected"
     resolved_program = (
         _format_program_label(program_title, program_code)
         if program_title
@@ -118,11 +120,12 @@ def format_status(
             f"study period: {selected_period}",
             f"semesterId: {semester_id if semester_id is not None else 'Not selected'}",
             f"department: {selected_department}",
-            f"program family: {selected_family}",
+            f"program: {selected_family}",
+            f"program code: {selected_program_code}",
             f"underlying RTU program: {resolved_program}",
-            f"programId: {program_id if program_id is not None else 'Not selected'}",
             f"course: {course_id if course_id is not None else 'Not selected'}",
             f"group: {selected_group}",
+            f"groupCode: {group_code if group_code else 'Not selected'}",
             f"semesterProgramId: {resolved_value}",
             f"scheduler: {'enabled' if scheduler_enabled else 'disabled'}",
             f"timezone: {timezone}",
@@ -224,3 +227,11 @@ def _format_program_label(program_title: str | None, program_code: str | None) -
     if program_code:
         return f"{program_title} ({program_code})"
     return program_title
+
+
+def _format_group_label(group_code: str | None, group_name: str | None) -> str:
+    if not group_code:
+        return "Not selected"
+    if group_name and group_name.strip().casefold() != group_code.strip().casefold():
+        return f"{group_code} — {group_name}"
+    return group_code

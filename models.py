@@ -5,8 +5,48 @@ from __future__ import annotations
 from calendar import monthrange
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
+import re
 from typing import Any
 from zoneinfo import ZoneInfo
+
+_GROUP_CODE_WHITESPACE_PATTERN = re.compile(r"\s+")
+
+
+def clean_group_label(value: str | None) -> str | None:
+    """Return a human-friendly group label."""
+    if value is None:
+        return None
+    cleaned = _GROUP_CODE_WHITESPACE_PATTERN.sub(" ", str(value).strip())
+    return cleaned or None
+
+
+def normalize_group_code(value: str | None) -> str:
+    """Return a normalized RTU group code for matching and storage."""
+    if value is None:
+        return ""
+    cleaned = _GROUP_CODE_WHITESPACE_PATTERN.sub("", str(value).strip())
+    return cleaned.upper()
+
+
+def infer_group_code(value: str | None) -> str | None:
+    """Infer a stable RTU group code from a legacy stored group value."""
+    cleaned = clean_group_label(value)
+    if not cleaned:
+        return None
+
+    lowered = cleaned.casefold()
+    if lowered.startswith("group "):
+        cleaned = cleaned[6:].strip()
+
+    for delimiter in (" — ", " - "):
+        if delimiter in cleaned:
+            candidate = cleaned.split(delimiter, 1)[0].strip()
+            if candidate:
+                cleaned = candidate
+                break
+
+    normalized = normalize_group_code(cleaned)
+    return normalized or None
 
 
 @dataclass(slots=True, frozen=True)
@@ -24,6 +64,26 @@ class ChatSelection:
     selected_group: str
     semester_program_id: int | None
     department_title: str | None = None
+    group_code: str | None = None
+    group_name: str | None = None
+    group_id: int | None = None
+
+    def resolved_group_code(self) -> str:
+        """Return the normalized group code, inferring it from legacy values when possible."""
+        return (
+            normalize_group_code(self.group_code)
+            or infer_group_code(self.selected_group)
+            or infer_group_code(self.group_name)
+            or ""
+        )
+
+    def display_group(self) -> str | None:
+        """Return the best human-friendly group label."""
+        return (
+            clean_group_label(self.group_name)
+            or clean_group_label(self.selected_group)
+            or clean_group_label(self.group_code)
+        )
 
     def is_complete(self) -> bool:
         """Return whether the selection has enough information to resolve a target."""
@@ -31,16 +91,20 @@ class ChatSelection:
             self.semester_id is not None
             and self.program_id is not None
             and self.course_id is not None
-            and bool(self.selected_group.strip())
+            and bool(self.resolved_group_code())
         )
 
-    def selection_key(self) -> tuple[int | None, int | None, int | None, str]:
+    def selection_key(self) -> tuple[int | None, int | None, int | None, str, int | None]:
         """Return a stable key for caching or de-duplicating a chat selection."""
+        group_key = self.resolved_group_code()
+        if not group_key and self.semester_program_id is not None:
+            group_key = f"semester-program:{self.semester_program_id}"
         return (
             self.semester_id,
             self.program_id,
             self.course_id,
-            self.selected_group,
+            group_key,
+            self.semester_program_id,
         )
 
 
@@ -52,19 +116,33 @@ class SelectionDraft:
     semester_title: str | None = None
     department_id: int | None = None
     department_title: str | None = None
+    selected_program_title: str | None = None
     program_family: str | None = None
     program_id: int | None = None
     program_title: str | None = None
     program_code: str | None = None
     course_id: int | None = None
 
-    def clear_from_program(self) -> None:
-        """Reset the program-dependent portion of the draft."""
+    def clear_exact_program(self) -> None:
+        """Reset the exact program-code-dependent portion of the draft."""
         self.program_family = None
         self.program_id = None
         self.program_title = None
         self.program_code = None
         self.course_id = None
+
+    def clear_from_program(self) -> None:
+        """Reset the program-dependent portion of the draft."""
+        self.selected_program_title = None
+        self.clear_exact_program()
+
+    def clear_from_course(self) -> None:
+        """Reset the course-dependent portion of the draft."""
+        self.course_id = None
+
+    def selected_title(self) -> str | None:
+        """Return the currently selected display title, if any."""
+        return self.selected_program_title or self.program_family or self.program_title
 
 
 @dataclass(slots=True, frozen=True)
@@ -99,10 +177,22 @@ class StudyProgram:
     department_title: str | None = None
     department_code: str | None = None
 
+    def display_label(self) -> str:
+        """Return a Telegram-friendly label for the study program."""
+        title = str(self.title).strip()
+        code = str(self.code).strip() if self.code else None
+        if title and code:
+            return f"{title} ({code})"
+        if title:
+            return title
+        if code:
+            return code
+        return "Unknown program"
+
 
 @dataclass(slots=True, frozen=True)
 class StudyProgramFamily:
-    """A deduplicated program family shown to Telegram users."""
+    """A legacy deduplicated program family used for saved-selection fallback."""
 
     family_key: str
     display_name: str
@@ -128,10 +218,25 @@ class ResolvedSemesterProgram:
     semester_id: int
     program_id: int
     course_id: int
-    group: str
+    group_code: str
+    group_name: str | None = None
+    group_id: int | None = None
     program_code: str | None = None
     program_title: str | None = None
     published: bool | None = None
+
+    @property
+    def group(self) -> str:
+        """Backward-compatible display label for the resolved group."""
+        return self.display_group()
+
+    def normalized_group_code(self) -> str:
+        """Return the normalized group code."""
+        return normalize_group_code(self.group_code)
+
+    def display_group(self) -> str:
+        """Return the best human-friendly label for the resolved group."""
+        return clean_group_label(self.group_name) or clean_group_label(self.group_code) or "Unknown group"
 
 
 @dataclass(slots=True, frozen=True)

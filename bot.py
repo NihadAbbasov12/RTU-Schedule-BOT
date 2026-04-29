@@ -41,7 +41,8 @@ from models import (
     ScheduleEvent,
     SelectionDraft,
     StudyDepartment,
-    StudyProgramFamily,
+    StudyProgram,
+    clean_group_label,
     combine_local_datetime,
     get_academic_week_range,
     get_month_range,
@@ -50,6 +51,7 @@ from models import (
     get_tomorrow_range,
     get_week_key,
     get_week_range,
+    normalize_group_code,
 )
 from rtu_api import RTUAPIError, RTUPublicationError, RTUResolutionError, RTUScheduleClient
 from storage import SnapshotStorage
@@ -70,8 +72,9 @@ WEEKEND_MESSAGE = "That was the last lesson for this week. Have a great weekend!
 SELECTION_TITLE = "RTU Schedule Setup"
 SCHEDULE_REQUEST_ACTIONS = {"today", "tomorrow", "week", "month", "subjects", "refresh", "status"}
 
-PROGRAM_PAGE_SIZE = 8
+PROGRAM_PAGE_SIZE = 12
 SMALL_PAGE_SIZE = 8
+SelectionCacheKey = tuple[int | None, int | None, int | None, str, int | None]
 
 
 class ScheduleBotApp:
@@ -146,14 +149,18 @@ class ScheduleBotApp:
             LOGGER.debug("Weekend check skipped because all chats are already marked for %s", week_key)
             return
 
-        targets_by_key: dict[tuple[int | None, int | None, int | None, str], ResolvedSemesterProgram] = {}
+        targets_by_key: dict[SelectionCacheKey, ResolvedSemesterProgram] = {}
+        selection_by_key: dict[SelectionCacheKey, ChatSelection] = {}
         events_by_semester_program: dict[int, list[ScheduleEvent]] = {}
 
         for selection in pending:
-            if not selection.is_complete():
+            if not self._selection_has_resolvable_target(selection):
                 LOGGER.warning(
-                    "Weekend check skipped incomplete selection for chat_id=%s",
+                    "Skipping chat %s during weekend check: selection is incomplete or missing group_code course_id=%s saved_group_code=%s saved_group=%s",
                     selection.chat_id,
+                    selection.course_id,
+                    selection.resolved_group_code() or None,
+                    selection.display_group(),
                 )
                 continue
 
@@ -162,8 +169,18 @@ class ScheduleBotApp:
                 continue
 
             try:
-                _, target = await self._resolve_selection_context(selection)
+                updated_selection, target = await self._resolve_selection_context(selection)
+                selection_by_key[selection_key] = updated_selection
                 targets_by_key[selection_key] = target
+            except RTUResolutionError as exc:
+                LOGGER.warning(
+                    "Skipping chat %s: saved group_code %s could not be resolved for semester_id=%s program_id=%s course_id=%s",
+                    selection.chat_id,
+                    selection.resolved_group_code() or None,
+                    selection.semester_id,
+                    selection.program_id,
+                    selection.course_id,
+                )
             except RTUAPIError:
                 LOGGER.exception(
                     "Weekend check failed while resolving chat_id=%s selection=%s",
@@ -186,7 +203,7 @@ class ScheduleBotApp:
                 )
 
         for selection in pending:
-            if not selection.is_complete():
+            if not self._selection_has_resolvable_target(selection):
                 continue
 
             try:
@@ -194,6 +211,7 @@ class ScheduleBotApp:
                 if target is None:
                     continue
 
+                resolved_selection = selection_by_key.get(selection.selection_key(), selection)
                 events = events_by_semester_program.get(target.semester_program_id)
                 if events is None:
                     events = await asyncio.to_thread(
@@ -217,7 +235,8 @@ class ScheduleBotApp:
                     self.storage.mark_weekend_notification_sent,
                     selection.chat_id,
                     week_key,
-                    selection.selected_group,
+                    resolved_selection.resolved_group_code() or target.group_code,
+                    resolved_selection.display_group() or target.group,
                     target.semester_program_id,
                 )
             except Exception:
@@ -249,26 +268,32 @@ class ScheduleBotApp:
             upper_bound_minutes,
         )
 
-        targets_by_key: dict[tuple[int | None, int | None, int | None, str], ResolvedSemesterProgram] = {}
+        targets_by_key: dict[SelectionCacheKey, ResolvedSemesterProgram] = {}
+        selection_by_key: dict[SelectionCacheKey, ChatSelection] = {}
         events_by_semester_program: dict[int, list[ScheduleEvent]] = {}
         reminders_sent = 0
         skipped_duplicates = 0
 
         for selection in selections:
-            if not selection.is_complete():
+            if not self._selection_has_resolvable_target(selection):
                 LOGGER.warning(
-                    "Reminder scan skipped incomplete selection for chat_id=%s",
+                    "Skipping chat %s during reminder scan: selection is incomplete or missing group_code course_id=%s saved_group_code=%s saved_group=%s",
                     selection.chat_id,
+                    selection.course_id,
+                    selection.resolved_group_code() or None,
+                    selection.display_group(),
                 )
                 continue
 
             selection_key = selection.selection_key()
             try:
                 if selection_key not in targets_by_key:
-                    _, target = await self._resolve_selection_context(selection)
+                    updated_selection, target = await self._resolve_selection_context(selection)
+                    selection_by_key[selection_key] = updated_selection
                     targets_by_key[selection_key] = target
 
                 target = targets_by_key[selection_key]
+                resolved_selection = selection_by_key.get(selection_key, selection)
                 if target.semester_program_id not in events_by_semester_program:
                     events_by_semester_program[target.semester_program_id] = await asyncio.to_thread(
                         self.api_client.get_events_for_range,
@@ -289,7 +314,7 @@ class ScheduleBotApp:
 
                     reminder_key = self._build_reminder_key(
                         selection.chat_id,
-                        target.semester_program_id,
+                        resolved_selection,
                         event,
                     )
                     acquired = await asyncio.to_thread(
@@ -298,6 +323,7 @@ class ScheduleBotApp:
                         reminder_key,
                         event.event_date,
                         event.start_time.strftime("%H:%M:%S"),
+                        resolved_selection.resolved_group_code() or target.group_code,
                         target.semester_program_id,
                     )
                     if not acquired:
@@ -318,6 +344,15 @@ class ScheduleBotApp:
                             reminder_key,
                         )
                         raise
+            except RTUResolutionError as exc:
+                LOGGER.warning(
+                    "Skipping chat %s: saved group_code %s could not be resolved for semester_id=%s program_id=%s course_id=%s",
+                    selection.chat_id,
+                    selection.resolved_group_code() or None,
+                    selection.semester_id,
+                    selection.program_id,
+                    selection.course_id,
+                )
             except Exception:
                 LOGGER.exception(
                     "Reminder delivery failed for chat_id=%s selection=%s",
@@ -552,7 +587,7 @@ class ScheduleBotApp:
                         "The setup flow was refreshed.\n\n"
                         f"Study period: {self.settings.rtu_semester_title}\n"
                         f"Department: {self.settings.rtu_department_title}\n\n"
-                        "Choose your program family."
+                        "Choose your study program."
                     ),
                 )
                 return
@@ -574,7 +609,7 @@ class ScheduleBotApp:
                         "The previous setup could not be recovered.\n\n"
                         f"Study period: {self.settings.rtu_semester_title}\n"
                         f"Department: {self.settings.rtu_department_title}\n\n"
-                        "Choose your program family again."
+                        "Choose your study program again."
                     ),
                 )
                 return
@@ -597,12 +632,14 @@ class ScheduleBotApp:
                 return
 
             if mode == "select":
-                identifier = int(parts[3])
+                identifier = parts[3]
                 await callback.answer()
-                if action == "prog":
-                    await self._select_program(chat_id, identifier, message)
+                if action == "progtitle":
+                    await self._select_program_title(chat_id, int(identifier), message)
+                elif action in {"progcode", "prog"}:
+                    await self._select_program(chat_id, int(identifier), message)
                 elif action == "course":
-                    await self._select_course(chat_id, identifier, message)
+                    await self._select_course(chat_id, int(identifier), message)
                 elif action == "group":
                     await self._select_group(chat_id, identifier, message)
                 else:
@@ -613,7 +650,7 @@ class ScheduleBotApp:
                             "The setup flow was refreshed.\n\n"
                             f"Study period: {self.settings.rtu_semester_title}\n"
                             f"Department: {self.settings.rtu_department_title}\n\n"
-                            "Choose your program family."
+                            "Choose your study program."
                         ),
                     )
                 return
@@ -689,7 +726,7 @@ class ScheduleBotApp:
             f"Study period: {self.settings.rtu_semester_title}",
             f"Department: {self.settings.rtu_department_title}",
             "",
-            "Choose your program family, then your course and group.",
+            "Choose your study program, then your course and group code.",
         ]
         if selection is not None:
             intro_lines.extend(["", "Current selection:"])
@@ -768,14 +805,14 @@ class ScheduleBotApp:
             heading_lines.extend(
                 [
                     "No study selection is saved for this chat yet.",
-                    "Use Change selection to choose your program family, course, and group.",
+                    "Use Change selection to choose your study program, course, and group.",
                     "",
                 ]
             )
-        elif not selection.is_complete():
+        elif not self._selection_has_resolvable_target(selection):
             heading_lines.extend(
                 [
-                    "Your saved selection is incomplete.",
+                    "Your saved selection is incomplete or missing a valid group code.",
                     "Use Change selection to finish the setup again.",
                     "",
                 ]
@@ -803,7 +840,16 @@ class ScheduleBotApp:
             if current_selection is not None
             else None,
             course_id=current_selection.course_id if current_selection is not None else None,
-            group=current_selection.selected_group if current_selection is not None else None,
+            group_code=(
+                current_selection.resolved_group_code()
+                if current_selection is not None
+                else (target.group_code if target is not None else None)
+            ),
+            group_name=(
+                current_selection.display_group()
+                if current_selection is not None
+                else (target.group_name if target is not None else None)
+            ),
             semester_program_id=target.semester_program_id if target is not None else None,
             scheduler_enabled=self.settings.enable_scheduler,
             timezone=self.settings.timezone,
@@ -816,11 +862,12 @@ class ScheduleBotApp:
         if context is None:
             return
 
-        _, target = context
+        selection, target = context
         try:
             changes = await asyncio.to_thread(
                 self._refresh_current_and_next_months,
                 chat_id,
+                selection.resolved_group_code() or target.group_code,
                 target.semester_program_id,
             )
         except RTUAPIError as exc:
@@ -928,6 +975,15 @@ class ScheduleBotApp:
             reply_markup=self._main_menu(chat_id),
         )
 
+    @staticmethod
+    def _selection_has_resolvable_target(selection: ChatSelection) -> bool:
+        return (
+            selection.semester_id is not None
+            and selection.program_id is not None
+            and selection.course_id is not None
+            and bool(selection.resolved_group_code() or selection.semester_program_id is not None)
+        )
+
     async def _resolve_chat_target(
         self,
         chat_id: int,
@@ -938,7 +994,7 @@ class ScheduleBotApp:
             if prompt_if_missing:
                 await self._prompt_for_selection(
                     chat_id,
-                    "Choose your program family, course, and group first to continue.",
+                    "Choose your study program, course, and group first to continue.",
                 )
             return None
 
@@ -950,7 +1006,7 @@ class ScheduleBotApp:
                         "This bot now uses only the current Foreign Students setup.\n\n"
                         f"Study period: {self.settings.rtu_semester_title}\n"
                         f"Department: {self.settings.rtu_department_title}\n\n"
-                        "Choose your program family again."
+                        "Choose your study program again."
                     ),
                 )
             return None
@@ -989,16 +1045,16 @@ class ScheduleBotApp:
                             "Your saved selection is outside the locked department.\n\n"
                             f"Study period: {self.settings.rtu_semester_title}\n"
                             f"Department: {self.settings.rtu_department_title}\n\n"
-                            "Choose your program family again."
+                            "Choose your study program again."
                         ),
                     )
                 return None
 
-        if not selection.is_complete():
+        if not self._selection_has_resolvable_target(selection):
             if prompt_if_missing:
                 await self._prompt_for_selection(
                     chat_id,
-                    "Your saved selection is incomplete. Choose your program family, course, and group again.",
+                    "Your saved selection is missing a valid group code. Choose your study program, course, and group again.",
                 )
             return None
 
@@ -1023,7 +1079,7 @@ class ScheduleBotApp:
             if prompt_if_missing:
                 await self._prompt_for_selection(
                     chat_id,
-                    f"I couldn't resolve your saved selection ({exc}). Please choose your program family again.",
+                    f"I couldn't resolve your saved selection ({exc}). Please choose your study program again.",
                 )
             else:
                 LOGGER.warning(
@@ -1056,6 +1112,13 @@ class ScheduleBotApp:
         target = await asyncio.to_thread(self.api_client.resolve_chat_selection, selection)
         updated_selection = await self._enrich_selection(selection, target)
         if updated_selection != selection:
+            LOGGER.info(
+                "Persisting refreshed selection metadata: chat_id=%s old_group_code=%s new_group_code=%s semester_program_id=%s",
+                selection.chat_id,
+                selection.resolved_group_code() or None,
+                updated_selection.resolved_group_code() or None,
+                updated_selection.semester_program_id,
+            )
             await asyncio.to_thread(self.storage.save_chat_selection, updated_selection)
         return updated_selection, target
 
@@ -1100,7 +1163,7 @@ class ScheduleBotApp:
                         program_family = family.display_name
                 except RTUAPIError:
                     LOGGER.debug(
-                        "Unable to enrich program family for chat_id=%s program_id=%s",
+                        "Unable to enrich program label for chat_id=%s program_id=%s",
                         selection.chat_id,
                         selection.program_id,
                     )
@@ -1113,13 +1176,16 @@ class ScheduleBotApp:
             semester_id=selection.semester_id or target.semester_id,
             semester_title=semester_title,
             program_family=program_family,
-            program_id=selection.program_id or target.program_id,
-            program_title=program_title,
-            program_code=program_code,
+            program_id=target.program_id,
+            program_title=target.program_title or program_title,
+            program_code=target.program_code or program_code,
             course_id=selection.course_id or target.course_id,
             selected_group=target.group,
             semester_program_id=target.semester_program_id,
             department_title=department_title,
+            group_code=target.group_code,
+            group_name=target.group_name,
+            group_id=target.group_id,
         )
 
     async def _broadcast_schedule_for_predefined_range(
@@ -1134,17 +1200,21 @@ class ScheduleBotApp:
             return
 
         start_date, end_date = range_factory(self.settings.zoneinfo)
-        targets_by_key: dict[tuple[int | None, int | None, int | None, str], ResolvedSemesterProgram] = {}
-        selection_by_key: dict[tuple[int | None, int | None, int | None, str], ChatSelection] = {}
-        errors_by_key: dict[tuple[int | None, int | None, int | None, str], str] = {}
+        targets_by_key: dict[SelectionCacheKey, ResolvedSemesterProgram] = {}
+        selection_by_key: dict[SelectionCacheKey, ChatSelection] = {}
+        errors_by_key: dict[SelectionCacheKey, str] = {}
         text_by_semester_program: dict[int, str] = {}
         errors_by_semester_program: dict[int, str] = {}
 
         for selection in selections:
-            if not selection.is_complete():
+            if not self._selection_has_resolvable_target(selection):
                 LOGGER.warning(
-                    "Scheduled action skipped incomplete selection for chat_id=%s",
+                    "Skipping chat %s for scheduled action %s: selection is incomplete or missing group_code course_id=%s saved_group_code=%s saved_group=%s",
                     selection.chat_id,
+                    action,
+                    selection.course_id,
+                    selection.resolved_group_code() or None,
+                    selection.display_group(),
                 )
                 continue
 
@@ -1168,8 +1238,12 @@ class ScheduleBotApp:
                 )
             except RTUResolutionError as exc:
                 LOGGER.warning(
-                    "Scheduled action failed while resolving selection=%s action=%s: %s",
-                    selection_key,
+                    "Skipping chat %s: saved group_code %s could not be resolved for semester_id=%s program_id=%s course_id=%s action=%s: %s",
+                    selection.chat_id,
+                    selection.resolved_group_code() or None,
+                    selection.semester_id,
+                    selection.program_id,
+                    selection.course_id,
                     action,
                     exc,
                 )
@@ -1216,7 +1290,7 @@ class ScheduleBotApp:
                 )
 
         for selection in selections:
-            if not selection.is_complete():
+            if not self._selection_has_resolvable_target(selection):
                 continue
 
             selection_key = selection.selection_key()
@@ -1260,6 +1334,7 @@ class ScheduleBotApp:
     def _refresh_current_and_next_months(
         self,
         chat_id: int,
+        group_code: str,
         semester_program_id: int,
     ) -> list[ScheduleDiff]:
         current_start, current_end = get_month_range(self.settings.zoneinfo)
@@ -1269,8 +1344,9 @@ class ScheduleBotApp:
         next_end = date(next_month_year, next_month, next_month_days)
 
         LOGGER.debug(
-            "Refreshing schedule snapshots: chat_id=%s semester_program_id=%s current=%s..%s next=%s..%s",
+            "Refreshing schedule snapshots: chat_id=%s group_code=%s semester_program_id=%s current=%s..%s next=%s..%s",
             chat_id,
+            group_code,
             semester_program_id,
             current_start,
             current_end,
@@ -1299,6 +1375,7 @@ class ScheduleBotApp:
 
         changes = self.storage.sync_month(
             chat_id,
+            group_code,
             semester_program_id,
             current_start.year,
             current_start.month,
@@ -1307,6 +1384,7 @@ class ScheduleBotApp:
         changes.extend(
             self.storage.sync_month(
                 chat_id,
+                group_code,
                 semester_program_id,
                 next_month_year,
                 next_month,
@@ -1388,12 +1466,14 @@ class ScheduleBotApp:
     @staticmethod
     def _build_reminder_key(
         chat_id: int,
-        semester_program_id: int,
+        selection: ChatSelection,
         event: ScheduleEvent,
     ) -> str:
         start_time = event.start_time.isoformat() if event.start_time is not None else "TBA"
+        group_code = selection.resolved_group_code() or "UNKNOWN"
         fingerprint = (
-            f"{chat_id}|{semester_program_id}|{event.event_date.isoformat()}|{start_time}|"
+            f"{chat_id}|{selection.semester_id}|{selection.program_id}|{selection.course_id}|"
+            f"{group_code}|{event.event_date.isoformat()}|{start_time}|"
             f"{event.stable_id()}|{event.title}|{event.lecturer}|{event.room}"
         )
         return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
@@ -1401,7 +1481,7 @@ class ScheduleBotApp:
     async def _configure_telegram_commands(self) -> None:
         await self.bot.set_my_commands(
             [
-                BotCommand(command="start", description="Choose your program family, course, and group"),
+                BotCommand(command="start", description="Choose your study program, course, and group"),
                 BotCommand(command="today", description="Show today's lessons"),
                 BotCommand(command="tomorrow", description="Show tomorrow's lessons"),
                 BotCommand(command="week", description="Show the next 7 days"),
@@ -1440,7 +1520,7 @@ class ScheduleBotApp:
         self,
         chat_id: int,
         message: Message | None = None,
-        intro_text: str = "Choose your program family to begin.",
+        intro_text: str = "Choose your study program to begin.",
     ) -> None:
         period = await asyncio.to_thread(self.api_client.get_locked_study_period)
         department = await asyncio.to_thread(
@@ -1501,17 +1581,25 @@ class ScheduleBotApp:
             await self._start_selection_prompt(
                 chat_id,
                 message=message,
-                intro_text="Choose your program family to begin.",
+                intro_text="Choose your study program to begin.",
             )
             return
 
         if draft.course_id is not None:
-            draft.course_id = None
+            draft.clear_from_course()
             await self._save_selection_draft(chat_id, draft)
             await self._show_course_prompt(chat_id, message=message)
             return
 
         if draft.program_id is not None:
+            if not draft.selected_program_title:
+                draft.selected_program_title = draft.program_title or draft.program_family
+            draft.clear_exact_program()
+            await self._save_selection_draft(chat_id, draft)
+            await self._show_program_code_prompt(chat_id, message=message)
+            return
+
+        if draft.selected_program_title:
             draft.clear_from_program()
             await self._save_selection_draft(chat_id, draft)
             await self._show_program_prompt(chat_id, message=message)
@@ -1526,8 +1614,10 @@ class ScheduleBotApp:
         message: Message | None,
         page: int,
     ) -> None:
-        if step == "prog":
+        if step in {"progtitle", "prog"}:
             await self._show_program_prompt(chat_id, message=message, page=page)
+        elif step == "progcode":
+            await self._show_program_code_prompt(chat_id, message=message, page=page)
         elif step == "course":
             await self._show_course_prompt(chat_id, message=message, page=page)
         elif step == "group":
@@ -1545,43 +1635,124 @@ class ScheduleBotApp:
             await self._start_selection_prompt(
                 chat_id,
                 message=message,
-                intro_text="Choose your program family to begin.",
+                intro_text="Choose your study program to begin.",
             )
             return
 
-        families = await asyncio.to_thread(
-            self.api_client.get_program_families,
+        titles = await asyncio.to_thread(
+            self.api_client.get_department_program_titles,
             draft.semester_id,
             self.settings.rtu_department_code,
         )
-        if not families:
+        if not titles:
             await self._start_selection_prompt(
                 chat_id,
                 message=message,
-                intro_text="No study programs were returned for the locked department. Please try again later.",
+                intro_text="No study program titles were returned for the locked department. Please try again later.",
             )
             return
 
-        page_items, page, total_pages = self._paginate(families, page, PROGRAM_PAGE_SIZE)
+        indexed_titles = list(enumerate(titles))
+        page_items, page, total_pages = self._paginate(indexed_titles, page, PROGRAM_PAGE_SIZE)
+        page_labels = [item[1] for item in page_items]
+        LOGGER.info(
+            "Showing program title prompt: chat_id=%s semester_id=%s department=%s page=%s/%s page_labels=%s all_titles=%s",
+            chat_id,
+            draft.semester_id,
+            self.settings.rtu_department_code,
+            page + 1,
+            total_pages,
+            page_labels,
+            titles,
+        )
         text = self._build_setup_text(
             summary_lines=self._draft_summary_lines(draft),
-            prompt="Choose your program family.",
+            prompt="Choose your program.",
             notice=notice,
             page=page,
             total_pages=total_pages,
         )
         markup = self._build_paginated_markup(
             items=page_items,
-            label_builder=lambda item: item.display_name,
-            callback_builder=lambda item: self._callback(
-                "prog",
-                "select",
-                item.representative_program.program_id,
-            ),
+            label_builder=lambda item: item[1],
+            callback_builder=lambda item: self._callback("progtitle", "select", item[0]),
             footer_rows=[self._back_cancel_row()],
             page=page,
             total_pages=total_pages,
-            page_callback_builder=lambda value: self._callback("prog", "page", value),
+            page_callback_builder=lambda value: self._callback("progtitle", "page", value),
+        )
+        await self._upsert_selection_message(chat_id, text, markup, message)
+
+    async def _show_program_code_prompt(
+        self,
+        chat_id: int,
+        message: Message | None = None,
+        page: int = 0,
+        notice: str | None = None,
+    ) -> None:
+        draft = await self._get_selection_draft(chat_id)
+        if draft is None or draft.semester_id is None:
+            await self._start_selection_prompt(
+                chat_id,
+                message=message,
+                intro_text="Choose your study program to begin.",
+            )
+            return
+
+        selected_title = draft.selected_title()
+        if not selected_title:
+            await self._show_program_prompt(
+                chat_id,
+                message=message,
+                notice="Choose your program first.",
+            )
+            return
+
+        variants = await asyncio.to_thread(
+            self.api_client.get_department_program_variants_by_title,
+            draft.semester_id,
+            self.settings.rtu_department_code,
+            selected_title,
+        )
+        if not variants:
+            draft.clear_from_program()
+            await self._save_selection_draft(chat_id, draft)
+            await self._show_program_prompt(
+                chat_id,
+                message=message,
+                notice="No RTU program codes were returned for that program. Please choose another program.",
+            )
+            return
+
+        page_items, page, total_pages = self._paginate(variants, page, SMALL_PAGE_SIZE)
+        code_labels = [self._format_program_code_option_label(item) for item in variants]
+        LOGGER.info(
+            "Showing program code prompt: chat_id=%s semester_id=%s department=%s title=%r page=%s/%s variants=%s",
+            chat_id,
+            draft.semester_id,
+            self.settings.rtu_department_code,
+            selected_title,
+            page + 1,
+            total_pages,
+            [(program.code, program.program_id) for program in variants],
+        )
+        prompt = "Choose the RTU program code.\n\n" + selected_title + ":\n" + "\n".join(code_labels)
+        text = self._build_setup_text(
+            summary_lines=self._draft_summary_lines(draft),
+            prompt=prompt,
+            notice=notice,
+            page=page,
+            total_pages=total_pages,
+        )
+        markup = self._build_paginated_markup(
+            items=page_items,
+            label_builder=self._format_program_code_option_label,
+            callback_builder=lambda item: self._callback("progcode", "select", item.program_id),
+            footer_rows=[self._back_cancel_row()],
+            page=page,
+            total_pages=total_pages,
+            page_callback_builder=lambda value: self._callback("progcode", "page", value),
+            columns=3,
         )
         await self._upsert_selection_message(chat_id, text, markup, message)
 
@@ -1593,11 +1764,26 @@ class ScheduleBotApp:
         notice: str | None = None,
     ) -> None:
         draft = await self._get_selection_draft(chat_id)
-        if draft is None or draft.semester_id is None or draft.program_id is None:
+        if draft is None or draft.semester_id is None:
             await self._show_program_prompt(
                 chat_id,
                 message=message,
-                notice="Choose your program family first.",
+                notice="Choose your program first.",
+            )
+            return
+
+        if draft.program_id is None:
+            if draft.selected_program_title:
+                await self._show_program_code_prompt(
+                    chat_id,
+                    message=message,
+                    notice="Choose the RTU program code first.",
+                )
+                return
+            await self._show_program_prompt(
+                chat_id,
+                message=message,
+                notice="Choose your program first.",
             )
             return
 
@@ -1610,7 +1796,7 @@ class ScheduleBotApp:
             await self._show_program_prompt(
                 chat_id,
                 message=message,
-                notice="No course options were returned for the selected program family.",
+                notice="No course options were returned for the selected study program.",
             )
             return
 
@@ -1655,15 +1841,10 @@ class ScheduleBotApp:
             draft.semester_id,
             draft.program_id,
             draft.course_id,
-        )
-        LOGGER.info(
-            "Showing group prompt: chat_id=%s family=%s program_id=%s course_id=%s groups=%s",
-            chat_id,
             draft.program_family,
-            draft.program_id,
-            draft.course_id,
-            [(group.group, group.semester_program_id) for group in groups],
+            include_family_variants=False,
         )
+        self._log_group_options("Showing group prompt", chat_id, draft, groups)
         if not groups:
             await self._show_course_prompt(
                 chat_id,
@@ -1682,8 +1863,8 @@ class ScheduleBotApp:
         )
         markup = self._build_paginated_markup(
             items=page_items,
-            label_builder=lambda item: self._format_group_name(item.group),
-            callback_builder=lambda item: self._callback("group", "select", item.semester_program_id),
+            label_builder=self._format_group_option_label,
+            callback_builder=lambda item: self._callback("group", "select", item.group_code),
             footer_rows=[self._back_cancel_row()],
             page=page,
             total_pages=total_pages,
@@ -1691,6 +1872,50 @@ class ScheduleBotApp:
             columns=2,
         )
         await self._upsert_selection_message(chat_id, text, markup, message)
+
+    async def _select_program_title(
+        self,
+        chat_id: int,
+        title_index: int,
+        message: Message | None,
+    ) -> None:
+        draft = await self._get_selection_draft(chat_id)
+        if draft is None or draft.semester_id is None:
+            await self._start_selection_prompt(
+                chat_id,
+                message=message,
+                intro_text="Choose your study program to begin.",
+            )
+            return
+
+        titles = await asyncio.to_thread(
+            self.api_client.get_department_program_titles,
+            draft.semester_id,
+            self.settings.rtu_department_code,
+        )
+        if title_index < 0 or title_index >= len(titles):
+            await self._show_program_prompt(
+                chat_id,
+                message=message,
+                notice="That program is no longer available. Please choose another one.",
+            )
+            return
+
+        selected_title = titles[title_index]
+        draft.clear_from_program()
+        draft.selected_program_title = selected_title
+        await self._save_selection_draft(chat_id, draft)
+        LOGGER.info(
+            "Program title selected: chat_id=%s title=%s title_index=%s",
+            chat_id,
+            selected_title,
+            title_index,
+        )
+        await self._show_program_code_prompt(
+            chat_id,
+            message=message,
+            notice=f"Program selected: {selected_title}",
+        )
 
     async def _select_program(
         self,
@@ -1703,40 +1928,55 @@ class ScheduleBotApp:
             await self._start_selection_prompt(
                 chat_id,
                 message=message,
-                intro_text="Choose your program family to begin.",
+                intro_text="Choose your study program to begin.",
             )
             return
 
-        family = await asyncio.to_thread(
-            self.api_client.get_program_family_by_representative_id,
-            draft.semester_id,
-            self.settings.rtu_department_code,
-            program_id,
-        )
-        if family is None:
-            await self._show_program_prompt(
-                chat_id,
-                message=message,
-                notice="That program family is no longer available. Please choose another one.",
+        selected_title = draft.selected_title()
+        if selected_title:
+            variants = await asyncio.to_thread(
+                self.api_client.get_department_program_variants_by_title,
+                draft.semester_id,
+                self.settings.rtu_department_code,
+                selected_title,
             )
+            program = next((item for item in variants if item.program_id == program_id), None)
+        else:
+            program = await asyncio.to_thread(
+                self.api_client.get_department_program,
+                draft.semester_id,
+                self.settings.rtu_department_code,
+                program_id,
+            )
+
+        if program is None:
+            if selected_title:
+                await self._show_program_code_prompt(
+                    chat_id,
+                    message=message,
+                    notice="That RTU program code is no longer available. Please choose another one.",
+                )
+            else:
+                await self._show_program_prompt(
+                    chat_id,
+                    message=message,
+                    notice="That study program is no longer available. Please choose another one.",
+                )
             return
 
-        representative = family.representative_program
+        selected_program_label = program.display_label()
         LOGGER.info(
-            "Program family selected: chat_id=%s family=%s representative_program_id=%s code=%s variants=%s",
+            "Study program code selected: chat_id=%s title=%s code=%s program_id=%s",
             chat_id,
-            family.display_name,
-            representative.program_id,
-            representative.code,
-            [
-                f"{variant.program_id}:{variant.code or 'no-code'}"
-                for variant in family.variants
-            ],
+            program.title,
+            program.code,
+            program.program_id,
         )
-        draft.program_family = family.display_name
-        draft.program_id = representative.program_id
-        draft.program_title = representative.title
-        draft.program_code = representative.code
+        draft.selected_program_title = program.title
+        draft.program_family = program.title
+        draft.program_id = program.program_id
+        draft.program_title = program.title
+        draft.program_code = program.code
         draft.department_title = self.settings.rtu_department_title
         draft.course_id = None
         await self._save_selection_draft(chat_id, draft)
@@ -1747,10 +1987,10 @@ class ScheduleBotApp:
             draft.program_id,
         )
         if not courses:
-            await self._show_program_prompt(
+            await self._show_program_code_prompt(
                 chat_id,
                 message=message,
-                notice="RTU returned no course options for this program family.",
+                notice="RTU returned no course options for this program code.",
             )
             return
 
@@ -1762,9 +2002,17 @@ class ScheduleBotApp:
                 draft.semester_id,
                 draft.program_id,
                 draft.course_id,
+                draft.program_family,
+                include_family_variants=False,
+            )
+            self._log_group_options(
+                "Loaded group options after single-course program selection",
+                chat_id,
+                draft,
+                groups,
             )
             if not groups:
-                await self._show_program_prompt(
+                await self._show_course_prompt(
                     chat_id,
                     message=message,
                     notice="RTU returned no valid groups for the selected course.",
@@ -1773,11 +2021,11 @@ class ScheduleBotApp:
             if len(groups) == 1:
                 await self._complete_selection(
                     chat_id,
-                    groups[0].semester_program_id,
+                    groups[0].group_code,
                     message=message,
                     notice=(
-                        f"Program family selected: {family.display_name}. "
-                        f"Course {courses[0]} and {self._format_group_name(groups[0].group)} were selected automatically."
+                        f"Study program selected: {selected_program_label}. "
+                        f"Course {courses[0]} and {self._format_group_option_label(groups[0])} were selected automatically."
                     ),
                 )
                 return
@@ -1785,7 +2033,7 @@ class ScheduleBotApp:
                 chat_id,
                 message=message,
                 notice=(
-                    f"Program family selected: {family.display_name}. "
+                    f"Study program selected: {selected_program_label}. "
                     f"Course {courses[0]} was selected automatically."
                 ),
             )
@@ -1794,7 +2042,7 @@ class ScheduleBotApp:
         await self._show_course_prompt(
             chat_id,
             message=message,
-            notice=f"Program family selected: {family.display_name}",
+            notice=f"Study program selected: {selected_program_label}",
         )
 
     async def _select_course(
@@ -1804,11 +2052,26 @@ class ScheduleBotApp:
         message: Message | None,
     ) -> None:
         draft = await self._get_selection_draft(chat_id)
-        if draft is None or draft.semester_id is None or draft.program_id is None:
+        if draft is None or draft.semester_id is None:
             await self._show_program_prompt(
                 chat_id,
                 message=message,
-                notice="Choose your program family first.",
+                notice="Choose your program first.",
+            )
+            return
+
+        if draft.program_id is None:
+            if draft.selected_program_title:
+                await self._show_program_code_prompt(
+                    chat_id,
+                    message=message,
+                    notice="Choose the RTU program code first.",
+                )
+                return
+            await self._show_program_prompt(
+                chat_id,
+                message=message,
+                notice="Choose your program first.",
             )
             return
 
@@ -1828,9 +2091,9 @@ class ScheduleBotApp:
         draft.course_id = course_id
         await self._save_selection_draft(chat_id, draft)
         LOGGER.info(
-            "Course selected: chat_id=%s family=%s program_id=%s course_id=%s",
+            "Course selected: chat_id=%s program=%s program_id=%s course_id=%s",
             chat_id,
-            draft.program_family,
+            self._format_program_name(draft.program_title, draft.program_code),
             draft.program_id,
             course_id,
         )
@@ -1839,7 +2102,10 @@ class ScheduleBotApp:
             draft.semester_id,
             draft.program_id,
             draft.course_id,
+            draft.program_family,
+            include_family_variants=False,
         )
+        self._log_group_options("Loaded group options after course selection", chat_id, draft, groups)
         if not groups:
             await self._show_course_prompt(
                 chat_id,
@@ -1851,11 +2117,11 @@ class ScheduleBotApp:
         if len(groups) == 1:
             await self._complete_selection(
                 chat_id,
-                groups[0].semester_program_id,
+                groups[0].group_code,
                 message=message,
                 notice=(
                     f"Course {course_id} selected. "
-                    f"{self._format_group_name(groups[0].group)} was selected automatically."
+                    f"{self._format_group_option_label(groups[0])} was selected automatically."
                 ),
             )
             return
@@ -1869,28 +2135,33 @@ class ScheduleBotApp:
     async def _select_group(
         self,
         chat_id: int,
-        semester_program_id: int,
+        group_code: str,
         message: Message | None,
     ) -> None:
         draft = await self._get_selection_draft(chat_id)
+        normalized_group_code = normalize_group_code(group_code)
         LOGGER.info(
-            "Group selected: chat_id=%s semester_program_id=%s family=%s program_id=%s course_id=%s",
+            "Group selected: chat_id=%s group_code=%s program=%s program_id=%s course_id=%s",
             chat_id,
-            semester_program_id,
-            draft.program_family if draft is not None else None,
+            normalized_group_code,
+            self._format_program_name(
+                draft.program_title if draft is not None else None,
+                draft.program_code if draft is not None else None,
+            ),
             draft.program_id if draft is not None else None,
             draft.course_id if draft is not None else None,
         )
-        await self._complete_selection(chat_id, semester_program_id, message=message)
+        await self._complete_selection(chat_id, normalized_group_code, message=message)
 
     async def _complete_selection(
         self,
         chat_id: int,
-        semester_program_id: int,
+        group_code: str,
         message: Message | None,
         notice: str | None = None,
     ) -> None:
         draft = await self._get_selection_draft(chat_id)
+        normalized_group_code = normalize_group_code(group_code)
         if (
             draft is None
             or draft.semester_id is None
@@ -1898,17 +2169,27 @@ class ScheduleBotApp:
             or draft.course_id is None
         ):
             LOGGER.warning(
-                "Selection completion fallback triggered because draft is incomplete: chat_id=%s semester_program_id=%s draft=%s",
+                "Selection completion fallback triggered because draft is incomplete: chat_id=%s group_code=%s draft=%s",
                 chat_id,
-                semester_program_id,
+                normalized_group_code or None,
                 draft,
             )
+            if draft is not None and draft.semester_id is not None and draft.program_id is None and draft.selected_program_title:
+                await self._show_program_code_prompt(
+                    chat_id,
+                    message=message,
+                    notice=(
+                        "The final selection step could not be completed because the exact RTU code was missing. "
+                        "Choose the RTU program code again."
+                    ),
+                )
+                return
             await self._show_program_prompt(
                 chat_id,
                 message=message,
                 notice=(
                     "The final selection step could not be completed because the in-progress setup was incomplete. "
-                    "Choose your program family again."
+                    "Choose your study program again."
                 ),
             )
             return
@@ -1918,20 +2199,23 @@ class ScheduleBotApp:
             draft.semester_id,
             draft.program_id,
             draft.course_id,
+            draft.program_family,
+            include_family_variants=False,
         )
+        self._log_group_options("Validating selected group against exact group options", chat_id, draft, groups)
         group = next(
-            (item for item in groups if item.semester_program_id == semester_program_id),
+            (item for item in groups if item.normalized_group_code() == normalized_group_code),
             None,
         )
         if group is None:
             LOGGER.warning(
-                "Selected group was not found in current group list: chat_id=%s family=%s program_id=%s course_id=%s semester_program_id=%s groups=%s",
+                "Selected group_code was not found in current group list: chat_id=%s program=%s program_id=%s course_id=%s group_code=%s groups=%s",
                 chat_id,
-                draft.program_family,
+                self._format_program_name(draft.program_title, draft.program_code),
                 draft.program_id,
                 draft.course_id,
-                semester_program_id,
-                [(item.group, item.semester_program_id) for item in groups],
+                normalized_group_code or None,
+                [(item.group_code, item.group_name, item.semester_program_id) for item in groups],
             )
             await self._show_group_prompt(
                 chat_id,
@@ -1945,21 +2229,23 @@ class ScheduleBotApp:
 
         try:
             target = await asyncio.to_thread(
-                self.api_client.resolve_semester_program,
-                draft.semester_id,
-                draft.program_id,
-                draft.course_id,
-                group.group,
-                semester_program_id,
+                self.api_client.resolve_group_by_code,
+                semester_id=draft.semester_id,
+                program_id=draft.program_id,
+                course_id=draft.course_id,
+                group_code=normalized_group_code,
+                semester_program_id=group.semester_program_id,
+                program_family=draft.program_family,
+                allow_family_fallback=False,
             )
         except RTUPublicationError as exc:
             LOGGER.warning(
-                "Selected group is unpublished: chat_id=%s family=%s course_id=%s group=%s semester_program_id=%s error=%s",
+                "Selected group is unpublished: chat_id=%s program=%s course_id=%s group_code=%s semester_program_id=%s error=%s",
                 chat_id,
-                draft.program_family,
+                self._format_program_name(draft.program_title, draft.program_code),
                 draft.course_id,
-                group.group,
-                semester_program_id,
+                normalized_group_code,
+                group.semester_program_id,
                 exc,
             )
             await self._show_group_prompt(
@@ -1970,12 +2256,12 @@ class ScheduleBotApp:
             return
         except RTUAPIError as exc:
             LOGGER.exception(
-                "Failed to resolve selected group: chat_id=%s family=%s course_id=%s group=%s semester_program_id=%s",
+                "Failed to resolve selected group: chat_id=%s program=%s course_id=%s group_code=%s semester_program_id=%s",
                 chat_id,
-                draft.program_family,
+                self._format_program_name(draft.program_title, draft.program_code),
                 draft.course_id,
-                group.group,
-                semester_program_id,
+                normalized_group_code,
+                group.semester_program_id,
             )
             await self._show_group_prompt(
                 chat_id,
@@ -1985,11 +2271,12 @@ class ScheduleBotApp:
             return
 
         LOGGER.info(
-            "Final selection resolved: chat_id=%s family=%s program_id=%s course_id=%s group=%s semester_program_id=%s",
+            "Final selection resolved: chat_id=%s program=%s program_id=%s course_id=%s group_code=%s selected_group=%s semester_program_id=%s",
             chat_id,
-            draft.program_family,
+            self._format_program_name(draft.program_title, draft.program_code),
             draft.program_id,
             draft.course_id,
+            target.group_code,
             target.group,
             target.semester_program_id,
         )
@@ -2005,16 +2292,20 @@ class ScheduleBotApp:
             selected_group=target.group,
             semester_program_id=target.semester_program_id,
             department_title=draft.department_title or self.settings.rtu_department_title,
+            group_code=target.group_code,
+            group_name=target.group_name,
+            group_id=target.group_id,
         )
         try:
             await asyncio.to_thread(self.storage.save_chat_selection, selection)
         except Exception:
             LOGGER.exception(
-                "Failed to save chat selection: chat_id=%s family=%s course_id=%s group=%s semester_program_id=%s",
+                "Failed to save chat selection: chat_id=%s program=%s course_id=%s group_code=%s selected_group=%s semester_program_id=%s",
                 chat_id,
-                selection.program_family,
+                self._format_program_name(selection.program_title, selection.program_code),
                 selection.course_id,
-                selection.selected_group,
+                selection.resolved_group_code() or None,
+                selection.display_group(),
                 selection.semester_program_id,
             )
             await self._show_group_prompt(
@@ -2026,13 +2317,14 @@ class ScheduleBotApp:
 
         saved_selection = await asyncio.to_thread(self.storage.get_chat_selection, chat_id)
         LOGGER.info(
-            "Chat selection saved successfully: chat_id=%s family=%s course_id=%s group=%s semester_program_id=%s is_complete=%s",
+            "Chat selection saved successfully: chat_id=%s program=%s course_id=%s group_code=%s selected_group=%s semester_program_id=%s is_complete=%s",
             chat_id,
-            selection.program_family,
+            self._format_program_name(selection.program_title, selection.program_code),
             selection.course_id,
-            selection.selected_group,
+            selection.resolved_group_code() or None,
+            selection.display_group(),
             selection.semester_program_id,
-            saved_selection.is_complete() if saved_selection is not None else None,
+            self._selection_has_resolvable_target(saved_selection) if saved_selection is not None else None,
         )
         await self._clear_selection_draft(chat_id)
 
@@ -2051,7 +2343,7 @@ class ScheduleBotApp:
 
         await self._send_text(
             chat_id,
-            "The main menu is ready below. Use Change selection whenever you want to switch program family, course, or group.",
+            "The main menu is ready below. Use Change selection whenever you want to switch study program, course, or group.",
             reply_markup=self._main_menu(chat_id),
         )
         LOGGER.info("Main menu shown after successful selection completion: chat_id=%s", chat_id)
@@ -2151,7 +2443,7 @@ class ScheduleBotApp:
         await self._send_text(chat_id, text, reply_markup=reply_markup)
 
     @staticmethod
-    def _callback(action: str, mode: str, value: int | None = None) -> str:
+    def _callback(action: str, mode: str, value: int | str | None = None) -> str:
         if value is None:
             return f"{CALLBACK_PREFIX}:{action}:{mode}"
         return f"{CALLBACK_PREFIX}:{action}:{mode}:{value}"
@@ -2182,20 +2474,27 @@ class ScheduleBotApp:
             lines.append(f"Department: {selection.department_title}")
 
         if selection.program_family:
-            lines.append(f"Program family: {selection.program_family}")
+            lines.append(f"Program: {selection.program_family}")
+
+        if selection.program_code:
+            lines.append(f"Program code: {selection.program_code}")
 
         if selection.program_title:
             lines.append(
                 f"Underlying RTU program: {self._format_program_name(selection.program_title, selection.program_code)}"
             )
-        elif selection.program_id is not None:
-            lines.append(f"Underlying RTU program ID: {selection.program_id}")
 
         if selection.course_id is not None:
             lines.append(f"Course: {selection.course_id}")
 
-        if selection.selected_group:
-            lines.append(f"Group: {selection.selected_group}")
+        group_code = selection.resolved_group_code()
+        group_name = selection.display_group()
+        if group_code:
+            lines.append(f"Group code: {group_code}")
+        if group_name and normalize_group_code(group_name) != group_code:
+            lines.append(f"Group: {group_name}")
+        elif not group_code and group_name:
+            lines.append(f"Group: {group_name}")
 
         if include_resolved and selection.semester_program_id is not None:
             lines.append(f"semesterProgramId: {selection.semester_program_id}")
@@ -2207,8 +2506,11 @@ class ScheduleBotApp:
             f"Study period: {draft.semester_title or self.settings.rtu_semester_title}",
             f"Department: {draft.department_title or self.settings.rtu_department_title}",
         ]
-        if draft.program_family:
-            lines.append(f"Program family: {draft.program_family}")
+        selected_title = draft.selected_title()
+        if selected_title:
+            lines.append(f"Program: {selected_title}")
+        if draft.program_code:
+            lines.append(f"Program code: {draft.program_code}")
         if draft.program_title:
             lines.append(
                 f"Underlying RTU program: {self._format_program_name(draft.program_title, draft.program_code)}"
@@ -2225,6 +2527,21 @@ class ScheduleBotApp:
             return f"{title} ({code})"
         return title
 
+    def _format_program_option_label(self, program: StudyProgram) -> str:
+        return program.display_label()
+
+    @staticmethod
+    def _format_program_code_option_label(program: StudyProgram) -> str:
+        code = str(program.code).strip() if program.code else ""
+        if code:
+            return code
+        LOGGER.warning(
+            "RTU program variant is missing a code: title=%s program_id=%s",
+            program.title,
+            program.program_id,
+        )
+        return "No code"
+
     @staticmethod
     def _format_department_label(department: StudyDepartment) -> str:
         if department.code:
@@ -2235,14 +2552,71 @@ class ScheduleBotApp:
     def _truncate_label(text: str, max_length: int = 48) -> str:
         if len(text) <= max_length:
             return text
+        suffix_start = text.rfind(" (")
+        if suffix_start > 0 and text.endswith(")"):
+            suffix = text[suffix_start:]
+            if len(suffix) < max_length - 6:
+                prefix_length = max_length - len(suffix) - 3
+                return f"{text[:prefix_length].rstrip()}...{suffix}"
         return f"{text[: max_length - 3].rstrip()}..."
 
     @staticmethod
     def _format_group_name(group: str) -> str:
-        cleaned = group.strip()
+        cleaned = clean_group_label(group)
         if not cleaned:
-            return "Default group"
-        return f"Group {cleaned}"
+            return "Unknown group"
+        return cleaned
+
+    @staticmethod
+    def _format_group_label(group_code: str | None, group_name: str | None = None) -> str:
+        normalized_group_code = normalize_group_code(group_code)
+        cleaned_group_name = clean_group_label(group_name)
+        if not normalized_group_code:
+            return clean_group_label(group_name) or "Unknown group"
+        if cleaned_group_name and normalize_group_code(cleaned_group_name) != normalized_group_code:
+            return f"{normalized_group_code} — {cleaned_group_name}"
+        return normalized_group_code
+
+    @staticmethod
+    def _format_group_option_text(label: str) -> str:
+        cleaned_label = clean_group_label(label)
+        if not cleaned_label:
+            return "Unknown group"
+        if cleaned_label.casefold().startswith("group "):
+            return cleaned_label
+        return f"Group {cleaned_label}"
+
+    def _format_group_option_label(self, target: ResolvedSemesterProgram) -> str:
+        return self._format_group_option_text(
+            self._format_group_label(target.group_code, target.group_name)
+        )
+
+    def _log_group_options(
+        self,
+        message: str,
+        chat_id: int,
+        draft: SelectionDraft,
+        groups: list[ResolvedSemesterProgram],
+    ) -> None:
+        LOGGER.info(
+            "%s: chat_id=%s program_id=%s program_code=%s course_id=%s groups=%s",
+            message,
+            chat_id,
+            draft.program_id,
+            draft.program_code,
+            draft.course_id,
+            [
+                (
+                    group.program_id,
+                    group.program_code or draft.program_code,
+                    group.course_id,
+                    group.group_code,
+                    group.group_name,
+                    group.semester_program_id,
+                )
+                for group in groups
+            ],
+        )
 
     def _selection_context_line(
         self,
@@ -2253,24 +2627,28 @@ class ScheduleBotApp:
         program_title = target.program_title
         program_code = target.program_code
         course_id = target.course_id
-        group = target.group
+        group_code = target.group_code
+        group_name = target.group_name
 
         if selection is not None:
             program_family = selection.program_family
             program_title = selection.program_title or program_title
             program_code = selection.program_code or program_code
             course_id = selection.course_id or course_id
-            group = selection.selected_group or group
+            group_code = selection.resolved_group_code() or group_code
+            group_name = selection.display_group() or group_name
 
         parts: list[str] = []
-        if program_family:
+        if program_title and program_code:
+            parts.append(self._format_program_name(program_title, program_code))
+        elif program_family:
             parts.append(program_family)
         elif program_title:
             parts.append(self._format_program_name(program_title, program_code))
         if course_id is not None:
             parts.append(f"Course {course_id}")
-        if group:
-            parts.append(self._format_group_name(group))
+        if group_code or group_name:
+            parts.append(self._format_group_label(group_code, group_name))
 
         return " | ".join(parts) if parts else None
 
