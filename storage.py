@@ -11,8 +11,11 @@ from pathlib import Path
 from threading import Lock
 
 from models import (
+    STUDY_MODE_ERASMUS,
+    STUDY_MODE_FULL_TIME,
     BotUsageStats,
     ChatSelection,
+    ErasmusSubject,
     ScheduleDiff,
     ScheduleEvent,
     SelectionDraft,
@@ -20,6 +23,7 @@ from models import (
     infer_group_code,
     iter_month_dates,
     normalize_group_code,
+    normalize_subject_title,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -158,6 +162,21 @@ class SnapshotStorage:
                 )
                 """
             )
+            self.connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chat_erasmus_subjects (
+                    chat_id INTEGER NOT NULL,
+                    subject_id INTEGER NOT NULL,
+                    subject_code TEXT,
+                    subject_title TEXT NOT NULL,
+                    normalized_title TEXT NOT NULL,
+                    course_id INTEGER NOT NULL,
+                    semester_program_id INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (chat_id, semester_program_id, subject_id)
+                )
+                """
+            )
             self._ensure_chat_preferences_columns()
             self._ensure_chat_schedule_snapshots_columns()
             self._ensure_selection_drafts_columns()
@@ -191,6 +210,7 @@ class SnapshotStorage:
             ("group_name", "TEXT"),
             ("group_id", "INTEGER"),
             ("semester_program_id", "INTEGER"),
+            ("study_mode", "TEXT NOT NULL DEFAULT 'FULL_TIME'"),
         ):
             if column_name in columns:
                 continue
@@ -234,6 +254,8 @@ class SnapshotStorage:
             ("program_title", "TEXT"),
             ("program_code", "TEXT"),
             ("course_id", "INTEGER"),
+            ("study_mode", "TEXT"),
+            ("selected_subject_ids", "TEXT"),
         ):
             if column_name in columns:
                 continue
@@ -547,17 +569,25 @@ class SnapshotStorage:
 
     def save_chat_selection(self, selection: ChatSelection) -> None:
         """Upsert the current RTU study selection for a chat."""
-        if selection.semester_program_id is None:
-            raise ValueError("semester_program_id is required when saving a chat selection")
-        resolved_group_code = selection.resolved_group_code()
-        if not resolved_group_code:
-            raise ValueError("group_code is required when saving a chat selection")
+        is_erasmus = selection.is_erasmus()
+        if not is_erasmus:
+            if selection.semester_program_id is None:
+                raise ValueError("semester_program_id is required when saving a chat selection")
+            resolved_group_code = selection.resolved_group_code()
+            if not resolved_group_code:
+                raise ValueError("group_code is required when saving a chat selection")
+        else:
+            resolved_group_code = selection.resolved_group_code() or STUDY_MODE_ERASMUS
 
-        selected_group = selection.display_group() or selection.selected_group or resolved_group_code
+        selected_group = selection.display_group() or selection.selected_group or resolved_group_code or STUDY_MODE_ERASMUS
         group_name = clean_group_label(selection.group_name)
-        if group_name is None and normalize_group_code(selected_group) != resolved_group_code:
+        if group_name is None and selected_group and normalize_group_code(selected_group) != resolved_group_code:
             group_name = selected_group
         updated_at = datetime.now(timezone.utc).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+
+        # For Erasmus, semester_program_id stores a representative value (first course's group)
+        # to satisfy the legacy NOT NULL constraint; schedule fetching uses per-subject ids.
+        semester_program_id_to_store = selection.semester_program_id if selection.semester_program_id is not None else 0
 
         with self._lock:
             self.connection.execute(
@@ -577,9 +607,10 @@ class SnapshotStorage:
                     group_name,
                     group_id,
                     semester_program_id,
+                    study_mode,
                     updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(chat_id) DO UPDATE SET
                     semester_id = excluded.semester_id,
                     semester_title = excluded.semester_title,
@@ -594,6 +625,7 @@ class SnapshotStorage:
                     group_name = excluded.group_name,
                     group_id = excluded.group_id,
                     semester_program_id = excluded.semester_program_id,
+                    study_mode = excluded.study_mode,
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (
@@ -610,10 +642,16 @@ class SnapshotStorage:
                     resolved_group_code,
                     group_name,
                     selection.group_id,
-                    selection.semester_program_id,
+                    semester_program_id_to_store,
+                    selection.study_mode or STUDY_MODE_FULL_TIME,
                     updated_at,
                 ),
             )
+            if not is_erasmus:
+                self.connection.execute(
+                    "DELETE FROM chat_erasmus_subjects WHERE chat_id = ?",
+                    (selection.chat_id,),
+                )
             self.connection.commit()
 
         LOGGER.info(
@@ -627,6 +665,7 @@ class SnapshotStorage:
 
     def save_selection_draft(self, chat_id: int, draft: SelectionDraft) -> None:
         """Persist an in-progress selection draft for a chat."""
+        subject_ids_json = json.dumps(sorted(int(sid) for sid in draft.selected_subject_ids))
         with self._lock:
             self.connection.execute(
                 """
@@ -642,9 +681,11 @@ class SnapshotStorage:
                     program_title,
                     program_code,
                     course_id,
+                    study_mode,
+                    selected_subject_ids,
                     updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(chat_id) DO UPDATE SET
                     semester_id = excluded.semester_id,
                     semester_title = excluded.semester_title,
@@ -656,6 +697,8 @@ class SnapshotStorage:
                     program_title = excluded.program_title,
                     program_code = excluded.program_code,
                     course_id = excluded.course_id,
+                    study_mode = excluded.study_mode,
+                    selected_subject_ids = excluded.selected_subject_ids,
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (
@@ -670,6 +713,8 @@ class SnapshotStorage:
                     draft.program_title,
                     draft.program_code,
                     draft.course_id,
+                    draft.study_mode,
+                    subject_ids_json,
                 ),
             )
             self.connection.commit()
@@ -689,7 +734,9 @@ class SnapshotStorage:
                     program_id,
                     program_title,
                     program_code,
-                    course_id
+                    course_id,
+                    study_mode,
+                    selected_subject_ids
                 FROM selection_drafts
                 WHERE chat_id = ?
                 """,
@@ -698,6 +745,16 @@ class SnapshotStorage:
 
         if row is None:
             return None
+
+        selected_subject_ids: set[int] = set()
+        raw_ids = row["selected_subject_ids"]
+        if raw_ids:
+            try:
+                parsed = json.loads(raw_ids)
+                if isinstance(parsed, list):
+                    selected_subject_ids = {int(value) for value in parsed}
+            except (ValueError, TypeError):
+                LOGGER.warning("Unable to parse persisted draft subject ids for chat_id=%s", chat_id)
 
         return SelectionDraft(
             semester_id=int(row["semester_id"]) if row["semester_id"] is not None else None,
@@ -710,6 +767,8 @@ class SnapshotStorage:
             program_title=row["program_title"],
             program_code=row["program_code"],
             course_id=int(row["course_id"]) if row["course_id"] is not None else None,
+            study_mode=row["study_mode"] if row["study_mode"] else None,
+            selected_subject_ids=selected_subject_ids,
         )
 
     def delete_selection_draft(self, chat_id: int) -> None:
@@ -720,6 +779,91 @@ class SnapshotStorage:
                 DELETE FROM selection_drafts
                 WHERE chat_id = ?
                 """,
+                (chat_id,),
+            )
+            self.connection.commit()
+
+    def save_erasmus_subjects(
+        self,
+        chat_id: int,
+        subjects: list[ErasmusSubject],
+    ) -> None:
+        """Replace the saved Erasmus subject list for a chat."""
+        with self._lock:
+            self.connection.execute(
+                "DELETE FROM chat_erasmus_subjects WHERE chat_id = ?",
+                (chat_id,),
+            )
+            for subject in subjects:
+                normalized = subject.normalized_title or normalize_subject_title(subject.subject_title)
+                self.connection.execute(
+                    """
+                    INSERT INTO chat_erasmus_subjects (
+                        chat_id,
+                        subject_id,
+                        subject_code,
+                        subject_title,
+                        normalized_title,
+                        course_id,
+                        semester_program_id,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    """,
+                    (
+                        chat_id,
+                        int(subject.subject_id),
+                        subject.subject_code,
+                        subject.subject_title,
+                        normalized,
+                        int(subject.course_id),
+                        int(subject.semester_program_id),
+                    ),
+                )
+            self.connection.commit()
+
+        LOGGER.info(
+            "Saved Erasmus subjects: chat_id=%s count=%s",
+            chat_id,
+            len(subjects),
+        )
+
+    def get_erasmus_subjects(self, chat_id: int) -> list[ErasmusSubject]:
+        """Return the saved Erasmus subjects for a chat."""
+        with self._lock:
+            rows = self.connection.execute(
+                """
+                SELECT
+                    subject_id,
+                    subject_code,
+                    subject_title,
+                    normalized_title,
+                    course_id,
+                    semester_program_id
+                FROM chat_erasmus_subjects
+                WHERE chat_id = ?
+                ORDER BY course_id, subject_code, subject_title
+                """,
+                (chat_id,),
+            ).fetchall()
+
+        return [
+            ErasmusSubject(
+                subject_id=int(row["subject_id"]),
+                subject_code=row["subject_code"],
+                subject_title=str(row["subject_title"]),
+                normalized_title=str(row["normalized_title"]),
+                course_id=int(row["course_id"]),
+                semester_program_id=int(row["semester_program_id"]),
+            )
+            for row in rows
+        ]
+
+    def delete_erasmus_subjects(self, chat_id: int) -> None:
+        """Remove the saved Erasmus subject list for a chat."""
+        with self._lock:
+            self.connection.execute(
+                "DELETE FROM chat_erasmus_subjects WHERE chat_id = ?",
                 (chat_id,),
             )
             self.connection.commit()
@@ -774,7 +918,8 @@ class SnapshotStorage:
                     group_code,
                     group_name,
                     group_id,
-                    semester_program_id
+                    semester_program_id,
+                    study_mode
                 FROM chat_preferences
                 WHERE chat_id = ?
                 """,
@@ -814,7 +959,8 @@ class SnapshotStorage:
                     group_code,
                     group_name,
                     group_id,
-                    semester_program_id
+                    semester_program_id,
+                    study_mode
                 FROM chat_preferences
                 ORDER BY chat_id
                 """
@@ -826,6 +972,13 @@ class SnapshotStorage:
 
     @staticmethod
     def _row_to_chat_selection(row: sqlite3.Row) -> ChatSelection:
+        row_keys = row.keys() if hasattr(row, "keys") else []
+        study_mode_value = row["study_mode"] if "study_mode" in row_keys else None
+        semester_program_id_value = row["semester_program_id"]
+        if semester_program_id_value is not None:
+            semester_program_id_value = int(semester_program_id_value)
+            if semester_program_id_value == 0:
+                semester_program_id_value = None
         return ChatSelection(
             chat_id=int(row["chat_id"]),
             semester_id=int(row["semester_id"]) if row["semester_id"] is not None else None,
@@ -837,14 +990,11 @@ class SnapshotStorage:
             program_code=row["program_code"],
             course_id=int(row["course_id"]) if row["course_id"] is not None else None,
             selected_group=str(row["selected_group"]),
-            semester_program_id=(
-                int(row["semester_program_id"])
-                if row["semester_program_id"] is not None
-                else None
-            ),
+            semester_program_id=semester_program_id_value,
             group_code=str(row["group_code"]) if row["group_code"] is not None else None,
             group_name=row["group_name"],
             group_id=int(row["group_id"]) if row["group_id"] is not None else None,
+            study_mode=str(study_mode_value) if study_mode_value else STUDY_MODE_FULL_TIME,
         )
 
     def try_acquire_reminder_delivery(

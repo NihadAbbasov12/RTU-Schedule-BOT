@@ -11,6 +11,73 @@ from zoneinfo import ZoneInfo
 
 _GROUP_CODE_WHITESPACE_PATTERN = re.compile(r"\s+")
 
+# RTU event titles look like "{Abbr}(, {Abbr})*. {SubjectTitle}, {Lecturer}".
+# The prefix is one or more ASCII abbreviations (e.g. "Lect.", "Lab.", "Ex.",
+# "Pr.", "Cons.", "Ex. add.", "Lect, Lab.", "Lab, Pr.").
+_EVENT_TYPE_PREFIX_PATTERN = re.compile(r"^[A-Za-z]+(?:\s*,\s*[A-Za-z]+)*\.\s+")
+
+STUDY_MODE_FULL_TIME = "FULL_TIME"
+STUDY_MODE_ERASMUS = "ERASMUS"
+VALID_STUDY_MODES = frozenset({STUDY_MODE_FULL_TIME, STUDY_MODE_ERASMUS})
+
+
+def normalize_subject_title(value: str | None) -> str:
+    """Return a case-and-whitespace-normalized subject title for matching."""
+    if value is None:
+        return ""
+    cleaned = _GROUP_CODE_WHITESPACE_PATTERN.sub(" ", str(value).strip())
+    return cleaned.casefold()
+
+
+def extract_event_subject_title(
+    event_title: str | None,
+    lecturer_text: str | None = None,
+) -> str:
+    """Return the bare subject-name portion of an RTU event title.
+
+    RTU events are titled in the form
+        "{TypeAbbr}(, {TypeAbbr})*. {SubjectTitle}, {LecturerName(s)}"
+    e.g.  "Lect, Lab. Data Structures and Algorithms, P.Nidagundi"
+          "Ex. add. Object-Oriented Programming, G.Alksnis"
+          "Cons. Object-Oriented Programming, G.Alksnis"
+    so a naive equality check against the subject roster never matches.
+    This helper peels off the leading type abbreviations and the trailing
+    lecturer suffix (the latter only when ``lecturer_text`` is known, so
+    subject titles that themselves contain commas are preserved).
+    """
+    if event_title is None:
+        return ""
+    title = str(event_title).strip()
+    if not title:
+        return ""
+    if lecturer_text:
+        lecturer = str(lecturer_text).strip()
+        if lecturer:
+            suffix = f", {lecturer}"
+            if title.endswith(suffix):
+                title = title[: -len(suffix)].rstrip()
+    while True:
+        match = _EVENT_TYPE_PREFIX_PATTERN.match(title)
+        if not match:
+            break
+        title = title[match.end():]
+    return title.strip()
+
+
+def event_matches_picked_subject(event_subject_norm: str, picked_norm: str) -> bool:
+    """Return whether a normalized event subject matches a picked subject.
+
+    Accepts exact match or where the event-side title is the picked title
+    followed by a space-delimited continuation (handles RTU listing the
+    roster subject as ``Mathematics`` while scheduling events as
+    ``Mathematics 2``).
+    """
+    if not event_subject_norm or not picked_norm:
+        return False
+    if event_subject_norm == picked_norm:
+        return True
+    return event_subject_norm.startswith(picked_norm + " ")
+
 
 def clean_group_label(value: str | None) -> str | None:
     """Return a human-friendly group label."""
@@ -67,6 +134,10 @@ class ChatSelection:
     group_code: str | None = None
     group_name: str | None = None
     group_id: int | None = None
+    study_mode: str = STUDY_MODE_FULL_TIME
+
+    def is_erasmus(self) -> bool:
+        return self.study_mode == STUDY_MODE_ERASMUS
 
     def resolved_group_code(self) -> str:
         """Return the normalized group code, inferring it from legacy values when possible."""
@@ -122,6 +193,11 @@ class SelectionDraft:
     program_title: str | None = None
     program_code: str | None = None
     course_id: int | None = None
+    study_mode: str | None = None
+    selected_subject_ids: set[int] = field(default_factory=set)
+
+    def is_erasmus(self) -> bool:
+        return self.study_mode == STUDY_MODE_ERASMUS
 
     def clear_exact_program(self) -> None:
         """Reset the exact program-code-dependent portion of the draft."""
@@ -130,6 +206,7 @@ class SelectionDraft:
         self.program_title = None
         self.program_code = None
         self.course_id = None
+        self.selected_subject_ids = set()
 
     def clear_from_program(self) -> None:
         """Reset the program-dependent portion of the draft."""
@@ -208,6 +285,25 @@ class Subject:
     code: str
     title: str
     part: int | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class ErasmusSubject:
+    """A subject an Erasmus student has chosen to follow."""
+
+    subject_id: int
+    subject_code: str | None
+    subject_title: str
+    normalized_title: str
+    course_id: int
+    semester_program_id: int
+
+    def display_label(self) -> str:
+        code = (self.subject_code or "").strip()
+        title = self.subject_title.strip() or "Untitled"
+        if code:
+            return f"{code} {title}"
+        return title
 
 
 @dataclass(slots=True, frozen=True)

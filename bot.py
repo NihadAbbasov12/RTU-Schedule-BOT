@@ -35,7 +35,10 @@ from formatter import (
     split_message,
 )
 from models import (
+    STUDY_MODE_ERASMUS,
+    STUDY_MODE_FULL_TIME,
     ChatSelection,
+    ErasmusSubject,
     ResolvedSemesterProgram,
     ScheduleDiff,
     ScheduleEvent,
@@ -44,6 +47,8 @@ from models import (
     StudyProgram,
     clean_group_label,
     combine_local_datetime,
+    event_matches_picked_subject,
+    extract_event_subject_title,
     get_academic_week_range,
     get_month_range,
     get_now,
@@ -52,6 +57,7 @@ from models import (
     get_week_key,
     get_week_range,
     normalize_group_code,
+    normalize_subject_title,
 )
 from rtu_api import RTUAPIError, RTUPublicationError, RTUResolutionError, RTUScheduleClient
 from storage import SnapshotStorage
@@ -94,6 +100,7 @@ class ScheduleBotApp:
         self.router = Router()
         self.dispatcher.include_router(self.router)
         self._selection_drafts: dict[int, SelectionDraft] = {}
+        self._erasmus_subject_cache: dict[tuple[int, tuple[int, ...]], list[ErasmusSubject]] = {}
         self._register_handlers()
 
     async def start_polling(self) -> None:
@@ -154,6 +161,12 @@ class ScheduleBotApp:
         events_by_semester_program: dict[int, list[ScheduleEvent]] = {}
 
         for selection in pending:
+            if selection.is_erasmus():
+                LOGGER.info(
+                    "Skipping Erasmus chat %s in weekend check (broadcast not implemented for Erasmus yet)",
+                    selection.chat_id,
+                )
+                continue
             if not self._selection_has_resolvable_target(selection):
                 LOGGER.warning(
                     "Skipping chat %s during weekend check: selection is incomplete or missing group_code course_id=%s saved_group_code=%s saved_group=%s",
@@ -275,6 +288,12 @@ class ScheduleBotApp:
         skipped_duplicates = 0
 
         for selection in selections:
+            if selection.is_erasmus():
+                LOGGER.info(
+                    "Skipping Erasmus chat %s during reminder scan (reminders not implemented for Erasmus yet)",
+                    selection.chat_id,
+                )
+                continue
             if not self._selection_has_resolvable_target(selection):
                 LOGGER.warning(
                     "Skipping chat %s during reminder scan: selection is incomplete or missing group_code course_id=%s saved_group_code=%s saved_group=%s",
@@ -614,7 +633,19 @@ class ScheduleBotApp:
                 )
                 return
 
-            if mode in {"page", "select"} and len(parts) < 4:
+            if action == "subj" and mode in {"done", "all", "confirm", "edit"}:
+                await callback.answer()
+                if mode == "done":
+                    await self._show_erasmus_preview(chat_id, draft, message=message)
+                elif mode == "confirm":
+                    await self._save_erasmus_selection(chat_id, draft, message=message)
+                elif mode == "edit":
+                    await self._show_erasmus_subjects_prompt(chat_id, message=message)
+                else:  # "all"
+                    await self._toggle_all_erasmus_subjects(chat_id, message=message)
+                return
+
+            if mode in {"page", "select", "toggle"} and len(parts) < 4:
                 LOGGER.warning(
                     "Configuration callback payload is incomplete: chat_id=%s action=%s mode=%s data=%s",
                     chat_id,
@@ -631,10 +662,18 @@ class ScheduleBotApp:
                 await self._show_selection_page(chat_id, action, message=message, page=page)
                 return
 
+            if action == "subj" and mode == "toggle":
+                identifier = parts[3]
+                await callback.answer()
+                await self._toggle_erasmus_subject(chat_id, int(identifier), message=message)
+                return
+
             if mode == "select":
                 identifier = parts[3]
                 await callback.answer()
-                if action == "progtitle":
+                if action == "mode":
+                    await self._select_study_mode(chat_id, identifier, message)
+                elif action == "progtitle":
                     await self._select_program_title(chat_id, int(identifier), message)
                 elif action in {"progcode", "prog"}:
                     await self._select_program(chat_id, int(identifier), message)
@@ -650,7 +689,7 @@ class ScheduleBotApp:
                             "The setup flow was refreshed.\n\n"
                             f"Study period: {self.settings.rtu_semester_title}\n"
                             f"Department: {self.settings.rtu_department_title}\n\n"
-                            "Choose your study program."
+                            "Choose your study mode."
                         ),
                     )
                 return
@@ -726,7 +765,7 @@ class ScheduleBotApp:
             f"Study period: {self.settings.rtu_semester_title}",
             f"Department: {self.settings.rtu_department_title}",
             "",
-            "Choose your study program, then your course and group code.",
+            "First pick your study mode (Erasmus or Full Time), then your study program.",
         ]
         if selection is not None:
             intro_lines.extend(["", "Current selection:"])
@@ -735,6 +774,9 @@ class ScheduleBotApp:
         await self._start_selection_prompt(chat_id, intro_text="\n".join(intro_lines))
 
     async def _show_today(self, chat_id: int) -> None:
+        if await self._is_erasmus_chat(chat_id):
+            await self._send_erasmus_schedule(chat_id, "Today", get_today_range)
+            return
         await self._send_schedule_for_predefined_range(
             chat_id=chat_id,
             label="Today",
@@ -742,6 +784,9 @@ class ScheduleBotApp:
         )
 
     async def _show_tomorrow(self, chat_id: int) -> None:
+        if await self._is_erasmus_chat(chat_id):
+            await self._send_erasmus_schedule(chat_id, "Tomorrow", get_tomorrow_range)
+            return
         await self._send_schedule_for_predefined_range(
             chat_id=chat_id,
             label="Tomorrow",
@@ -749,6 +794,9 @@ class ScheduleBotApp:
         )
 
     async def _show_week(self, chat_id: int) -> None:
+        if await self._is_erasmus_chat(chat_id):
+            await self._send_erasmus_schedule(chat_id, "Week", get_week_range)
+            return
         await self._send_schedule_for_predefined_range(
             chat_id=chat_id,
             label="Week",
@@ -756,6 +804,9 @@ class ScheduleBotApp:
         )
 
     async def _show_month(self, chat_id: int) -> None:
+        if await self._is_erasmus_chat(chat_id):
+            await self._send_erasmus_schedule(chat_id, "Month", get_month_range)
+            return
         context = await self._resolve_chat_target(chat_id)
         if context is None:
             return
@@ -772,6 +823,9 @@ class ScheduleBotApp:
         )
 
     async def _show_subjects(self, chat_id: int) -> None:
+        if await self._is_erasmus_chat(chat_id):
+            await self._show_erasmus_subjects_list(chat_id)
+            return
         context = await self._resolve_chat_target(chat_id)
         if context is None:
             return
@@ -795,8 +849,153 @@ class ScheduleBotApp:
             reply_markup=self._main_menu(chat_id),
         )
 
+    async def _is_erasmus_chat(self, chat_id: int) -> bool:
+        selection = await asyncio.to_thread(self.storage.get_chat_selection, chat_id)
+        return selection is not None and selection.is_erasmus()
+
+    async def _send_erasmus_schedule(
+        self,
+        chat_id: int,
+        label: str,
+        range_factory: Callable[..., tuple[date, date]],
+    ) -> None:
+        selection = await asyncio.to_thread(self.storage.get_chat_selection, chat_id)
+        if selection is None or not selection.is_erasmus():
+            await self._prompt_for_selection(
+                chat_id,
+                "Choose your study mode, program, and subjects first to continue.",
+            )
+            return
+        subjects = await asyncio.to_thread(self.storage.get_erasmus_subjects, chat_id)
+        if not subjects:
+            await self._send_text(
+                chat_id,
+                "No Erasmus subjects are saved yet. Use Change selection to pick them.",
+                reply_markup=self._main_menu(chat_id),
+            )
+            return
+
+        start_date, end_date = range_factory(self.settings.zoneinfo)
+        events = await asyncio.to_thread(
+            self._collect_erasmus_events,
+            subjects,
+            start_date,
+            end_date,
+        )
+
+        context_line = self._erasmus_context_line(selection, subjects)
+        await self._send_text(
+            chat_id,
+            self._render_schedule_message(
+                label,
+                start_date,
+                end_date,
+                events,
+                context_line=context_line,
+            ),
+            reply_markup=self._main_menu(chat_id),
+        )
+
+    def _collect_erasmus_events(
+        self,
+        subjects: list[ErasmusSubject],
+        start_date: date,
+        end_date: date,
+    ) -> list[ScheduleEvent]:
+        """Fetch and filter events for all Erasmus-selected subjects."""
+        by_program: dict[int, list[ErasmusSubject]] = {}
+        for subject in subjects:
+            by_program.setdefault(subject.semester_program_id, []).append(subject)
+
+        collected: list[ScheduleEvent] = []
+        for semester_program_id, subject_list in by_program.items():
+            allowed = [subject.normalized_title for subject in subject_list]
+            try:
+                events = self.api_client.get_events_for_range(
+                    semester_program_id,
+                    start_date,
+                    end_date,
+                )
+            except RTUAPIError:
+                LOGGER.exception(
+                    "Failed to fetch Erasmus events for semester_program_id=%s",
+                    semester_program_id,
+                )
+                continue
+            for event in events:
+                event_subject = extract_event_subject_title(event.title, event.lecturer)
+                event_subject_norm = normalize_subject_title(event_subject)
+                if any(
+                    event_matches_picked_subject(event_subject_norm, picked)
+                    for picked in allowed
+                ):
+                    collected.append(event)
+        collected.sort(key=lambda event: event.sort_key())
+        return collected
+
+    async def _show_erasmus_subjects_list(self, chat_id: int) -> None:
+        selection = await asyncio.to_thread(self.storage.get_chat_selection, chat_id)
+        subjects = await asyncio.to_thread(self.storage.get_erasmus_subjects, chat_id)
+        if not subjects:
+            await self._send_text(
+                chat_id,
+                "No Erasmus subjects are saved yet. Use Change selection to pick them.",
+                reply_markup=self._main_menu(chat_id),
+            )
+            return
+        lines = ["Your Erasmus subjects:"]
+        if selection is not None and (selection.program_title or selection.program_family):
+            lines.append(f"Program: {selection.program_title or selection.program_family}")
+        lines.append("")
+        current_course: int | None = None
+        for subject in subjects:
+            if subject.course_id != current_course:
+                if current_course is not None:
+                    lines.append("")
+                lines.append(f"Course {subject.course_id}:")
+                current_course = subject.course_id
+            lines.append(f"  - {subject.display_label()}")
+        await self._send_text(
+            chat_id,
+            "\n".join(lines),
+            reply_markup=self._main_menu(chat_id),
+        )
+
+    def _erasmus_context_line(
+        self,
+        selection: ChatSelection | None,
+        subjects: list[ErasmusSubject] | None = None,
+    ) -> str | None:
+        parts: list[str] = ["Erasmus"]
+        if selection is not None:
+            program_label = self._format_program_name(selection.program_title, selection.program_code)
+            if program_label and program_label != "Not selected":
+                parts.append(program_label)
+            elif selection.program_family:
+                parts.append(selection.program_family)
+        if subjects is not None:
+            parts.append(f"{len(subjects)} subject(s)")
+        return " | ".join(parts) if parts else None
+
     async def _show_status(self, chat_id: int) -> None:
         selection = await asyncio.to_thread(self.storage.get_chat_selection, chat_id)
+
+        if selection is not None and selection.is_erasmus():
+            subjects = await asyncio.to_thread(self.storage.get_erasmus_subjects, chat_id)
+            lines = [
+                "Mode: Erasmus",
+                f"Study period: {selection.semester_title or self.settings.rtu_semester_title}",
+                f"Department: {selection.department_title or self.settings.rtu_department_title}",
+                f"Program: {selection.program_title or selection.program_family or 'Unknown'}",
+            ]
+            if selection.program_code:
+                lines.append(f"Program code: {selection.program_code}")
+            lines.append(f"Subjects selected: {len(subjects)}")
+            lines.append(f"Scheduler enabled: {self.settings.enable_scheduler}")
+            lines.append(f"Timezone: {self.settings.timezone}")
+            await self._send_text(chat_id, "\n".join(lines), reply_markup=self._main_menu(chat_id))
+            return
+
         heading_lines: list[str] = []
         current_selection = selection
         target: ResolvedSemesterProgram | None = None
@@ -858,6 +1057,13 @@ class ScheduleBotApp:
         await self._send_text(chat_id, status_text, reply_markup=self._main_menu(chat_id))
 
     async def _show_refresh(self, chat_id: int) -> None:
+        if await self._is_erasmus_chat(chat_id):
+            await self._send_text(
+                chat_id,
+                "Refresh diff is not available in Erasmus mode. Use Today/Tomorrow/Week to view your current schedule.",
+                reply_markup=self._main_menu(chat_id),
+            )
+            return
         context = await self._resolve_chat_target(chat_id)
         if context is None:
             return
@@ -1207,6 +1413,13 @@ class ScheduleBotApp:
         errors_by_semester_program: dict[int, str] = {}
 
         for selection in selections:
+            if selection.is_erasmus():
+                LOGGER.info(
+                    "Skipping Erasmus chat %s for scheduled action %s (Erasmus broadcasts not implemented yet)",
+                    selection.chat_id,
+                    action,
+                )
+                continue
             if not self._selection_has_resolvable_target(selection):
                 LOGGER.warning(
                     "Skipping chat %s for scheduled action %s: selection is incomplete or missing group_code course_id=%s saved_group_code=%s saved_group=%s",
@@ -1554,7 +1767,7 @@ class ScheduleBotApp:
                 message=message,
             )
 
-        await self._show_program_prompt(chat_id)
+        await self._show_mode_prompt(chat_id)
 
     async def _prompt_for_selection(self, chat_id: int, reason: str) -> None:
         await self._start_selection_prompt(chat_id, intro_text=reason)
@@ -1581,8 +1794,14 @@ class ScheduleBotApp:
             await self._start_selection_prompt(
                 chat_id,
                 message=message,
-                intro_text="Choose your study program to begin.",
+                intro_text="Choose your study mode to begin.",
             )
+            return
+
+        if draft.is_erasmus() and draft.program_id is not None:
+            draft.clear_from_program()
+            await self._save_selection_draft(chat_id, draft)
+            await self._show_program_prompt(chat_id, message=message)
             return
 
         if draft.course_id is not None:
@@ -1605,7 +1824,13 @@ class ScheduleBotApp:
             await self._show_program_prompt(chat_id, message=message)
             return
 
-        await self._show_program_prompt(chat_id, message=message)
+        if draft.study_mode is not None:
+            draft.study_mode = None
+            await self._save_selection_draft(chat_id, draft)
+            await self._show_mode_prompt(chat_id, message=message)
+            return
+
+        await self._show_mode_prompt(chat_id, message=message)
 
     async def _show_selection_page(
         self,
@@ -1622,6 +1847,86 @@ class ScheduleBotApp:
             await self._show_course_prompt(chat_id, message=message, page=page)
         elif step == "group":
             await self._show_group_prompt(chat_id, message=message, page=page)
+        elif step == "subj":
+            await self._show_erasmus_subjects_prompt(chat_id, message=message, page=page)
+
+    async def _show_mode_prompt(
+        self,
+        chat_id: int,
+        message: Message | None = None,
+        notice: str | None = None,
+    ) -> None:
+        draft = await self._get_selection_draft(chat_id)
+        if draft is None or draft.semester_id is None:
+            await self._start_selection_prompt(
+                chat_id,
+                message=message,
+                intro_text="Choose your study mode to begin.",
+            )
+            return
+
+        text = self._build_setup_text(
+            summary_lines=[
+                f"Study period: {draft.semester_title or self.settings.rtu_semester_title}",
+                f"Department: {draft.department_title or self.settings.rtu_department_title}",
+            ],
+            prompt="Choose your study mode.",
+            notice=notice,
+        )
+        rows = [
+            [
+                InlineKeyboardButton(
+                    text="Erasmus",
+                    callback_data=self._callback("mode", "select", "erasmus"),
+                ),
+                InlineKeyboardButton(
+                    text="Full Time",
+                    callback_data=self._callback("mode", "select", "fulltime"),
+                ),
+            ],
+            self._cancel_row(),
+        ]
+        markup = InlineKeyboardMarkup(inline_keyboard=rows)
+        await self._upsert_selection_message(chat_id, text, markup, message)
+
+    async def _select_study_mode(
+        self,
+        chat_id: int,
+        identifier: str,
+        message: Message | None,
+    ) -> None:
+        draft = await self._get_selection_draft(chat_id)
+        if draft is None or draft.semester_id is None:
+            await self._start_selection_prompt(
+                chat_id,
+                message=message,
+                intro_text="Choose your study mode to begin.",
+            )
+            return
+
+        identifier_normalized = identifier.lower()
+        if identifier_normalized == "erasmus":
+            draft.study_mode = STUDY_MODE_ERASMUS
+            mode_label = "Erasmus"
+        elif identifier_normalized in {"fulltime", "full_time", "full-time"}:
+            draft.study_mode = STUDY_MODE_FULL_TIME
+            mode_label = "Full Time"
+        else:
+            await self._show_mode_prompt(
+                chat_id,
+                message=message,
+                notice="Unknown study mode. Please pick one of the options.",
+            )
+            return
+
+        draft.clear_from_program()
+        await self._save_selection_draft(chat_id, draft)
+        LOGGER.info("Study mode selected: chat_id=%s mode=%s", chat_id, draft.study_mode)
+        await self._show_program_prompt(
+            chat_id,
+            message=message,
+            notice=f"{mode_label} mode selected. Choose your study program.",
+        )
 
     async def _show_program_prompt(
         self,
@@ -1637,6 +1942,9 @@ class ScheduleBotApp:
                 message=message,
                 intro_text="Choose your study program to begin.",
             )
+            return
+        if draft.study_mode is None:
+            await self._show_mode_prompt(chat_id, message=message)
             return
 
         titles = await asyncio.to_thread(
@@ -1911,6 +2219,37 @@ class ScheduleBotApp:
             selected_title,
             title_index,
         )
+
+        if draft.is_erasmus():
+            variants = await asyncio.to_thread(
+                self.api_client.get_department_program_variants_by_title,
+                draft.semester_id,
+                self.settings.rtu_department_code,
+                selected_title,
+            )
+            if not variants:
+                await self._show_program_prompt(
+                    chat_id,
+                    message=message,
+                    notice="RTU returned no program variants for this title. Please pick another program.",
+                )
+                return
+            representative = variants[0]
+            draft.program_family = selected_title
+            draft.program_id = representative.program_id
+            draft.program_title = selected_title
+            draft.program_code = None
+            draft.department_title = self.settings.rtu_department_title
+            draft.course_id = None
+            draft.selected_subject_ids = set()
+            await self._save_selection_draft(chat_id, draft)
+            await self._show_erasmus_subjects_prompt(
+                chat_id,
+                message=message,
+                notice=f"Program selected: {selected_title}. Pick the subjects you'll attend.",
+            )
+            return
+
         await self._show_program_code_prompt(
             chat_id,
             message=message,
@@ -1979,7 +2318,16 @@ class ScheduleBotApp:
         draft.program_code = program.code
         draft.department_title = self.settings.rtu_department_title
         draft.course_id = None
+        draft.selected_subject_ids = set()
         await self._save_selection_draft(chat_id, draft)
+
+        if draft.is_erasmus():
+            await self._show_erasmus_subjects_prompt(
+                chat_id,
+                message=message,
+                notice=f"Study program selected: {selected_program_label}. Pick the subjects you'll attend.",
+            )
+            return
 
         courses = await asyncio.to_thread(
             self.api_client.get_courses,
@@ -2152,6 +2500,499 @@ class ScheduleBotApp:
             draft.course_id if draft is not None else None,
         )
         await self._complete_selection(chat_id, normalized_group_code, message=message)
+
+    async def _erasmus_program_ids(
+        self,
+        semester_id: int,
+        title: str | None,
+        fallback_program_id: int | None,
+    ) -> list[int]:
+        """Return every variant program_id sharing the given title (e.g. ADBD0, ADBDW, ADMD0, ADMDW)."""
+        if title:
+            variants = await asyncio.to_thread(
+                self.api_client.get_department_program_variants_by_title,
+                semester_id,
+                self.settings.rtu_department_code,
+                title,
+            )
+            ids = [variant.program_id for variant in variants]
+            if ids:
+                return ids
+        if fallback_program_id is not None:
+            return [fallback_program_id]
+        return []
+
+    async def _load_erasmus_subject_options(
+        self,
+        semester_id: int,
+        program_ids: list[int],
+        program_family: str | None,
+    ) -> list[ErasmusSubject]:
+        """Aggregate subjects across every program variant and course for Erasmus picking."""
+        if not program_ids:
+            return []
+        cache_key = (semester_id, tuple(sorted(set(program_ids))))
+        cached = self._erasmus_subject_cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
+
+        aggregated: list[ErasmusSubject] = []
+        seen_subject_ids: set[int] = set()
+        for program_id in program_ids:
+            try:
+                courses = await asyncio.to_thread(
+                    self.api_client.get_courses,
+                    semester_id,
+                    program_id,
+                )
+            except RTUAPIError:
+                LOGGER.exception(
+                    "Failed to load courses for Erasmus aggregation: semester_id=%s program_id=%s",
+                    semester_id,
+                    program_id,
+                )
+                continue
+            for course_id in courses:
+                try:
+                    groups = await asyncio.to_thread(
+                        self.api_client.get_display_groups,
+                        semester_id,
+                        program_id,
+                        course_id,
+                        program_family,
+                        include_family_variants=False,
+                    )
+                except RTUAPIError:
+                    LOGGER.exception(
+                        "Failed to load groups for Erasmus aggregation: semester_id=%s program_id=%s course_id=%s",
+                        semester_id,
+                        program_id,
+                        course_id,
+                    )
+                    continue
+                if not groups:
+                    continue
+                first_group = groups[0]
+                try:
+                    subjects = await asyncio.to_thread(
+                        self.api_client.get_subjects,
+                        first_group.semester_program_id,
+                    )
+                except RTUAPIError:
+                    LOGGER.exception(
+                        "Failed to load subjects for Erasmus aggregation: semester_program_id=%s",
+                        first_group.semester_program_id,
+                    )
+                    continue
+                for subject in subjects:
+                    if subject.subject_id in seen_subject_ids:
+                        continue
+                    seen_subject_ids.add(subject.subject_id)
+                    aggregated.append(
+                        ErasmusSubject(
+                            subject_id=subject.subject_id,
+                            subject_code=subject.code or None,
+                            subject_title=subject.title,
+                            normalized_title=normalize_subject_title(subject.title),
+                            course_id=course_id,
+                            semester_program_id=first_group.semester_program_id,
+                        )
+                    )
+
+        aggregated.sort(key=lambda s: (s.course_id, (s.subject_code or "").casefold(), s.subject_title.casefold()))
+        self._erasmus_subject_cache[cache_key] = list(aggregated)
+        return aggregated
+
+    async def _show_erasmus_subjects_prompt(
+        self,
+        chat_id: int,
+        message: Message | None = None,
+        page: int = 0,
+        notice: str | None = None,
+    ) -> None:
+        draft = await self._get_selection_draft(chat_id)
+        if (
+            draft is None
+            or draft.semester_id is None
+            or draft.program_id is None
+            or not draft.is_erasmus()
+        ):
+            await self._show_mode_prompt(chat_id, message=message)
+            return
+
+        program_ids = await self._erasmus_program_ids(
+            draft.semester_id,
+            draft.selected_title(),
+            draft.program_id,
+        )
+        try:
+            options = await self._load_erasmus_subject_options(
+                draft.semester_id,
+                program_ids,
+                draft.program_family,
+            )
+        except RTUAPIError as exc:
+            await self._show_program_prompt(
+                chat_id,
+                message=message,
+                notice=f"I couldn't load Erasmus subjects right now: {exc}",
+            )
+            return
+
+        if not options:
+            await self._show_program_prompt(
+                chat_id,
+                message=message,
+                notice="RTU returned no subjects for this program. Please pick another program.",
+            )
+            return
+
+        valid_ids = {option.subject_id for option in options}
+        if not draft.selected_subject_ids.issubset(valid_ids):
+            draft.selected_subject_ids &= valid_ids
+            await self._save_selection_draft(chat_id, draft)
+
+        page_items, page, total_pages = self._paginate(options, page, SMALL_PAGE_SIZE)
+        selected_count = len(draft.selected_subject_ids)
+
+        summary_lines = self._draft_summary_lines(draft)
+        summary_lines.append(f"Selected subjects: {selected_count}")
+
+        prompt = (
+            "Toggle the subjects you'll attend, then tap Done.\n"
+            "Tap a row to add/remove it. Use Select all to toggle every subject at once."
+        )
+        text = self._build_setup_text(
+            summary_lines=summary_lines,
+            prompt=prompt,
+            notice=notice,
+            page=page,
+            total_pages=total_pages,
+        )
+
+        rows: list[list[InlineKeyboardButton]] = []
+        for option in page_items:
+            mark = "[x]" if option.subject_id in draft.selected_subject_ids else "[ ]"
+            label = f"{mark} {self._format_erasmus_subject_label(option)}"
+            rows.append([
+                InlineKeyboardButton(
+                    text=self._truncate_label(label, max_length=60),
+                    callback_data=self._callback("subj", "toggle", option.subject_id),
+                )
+            ])
+
+        if total_pages > 1:
+            nav_buttons: list[InlineKeyboardButton] = []
+            if page > 0:
+                nav_buttons.append(
+                    InlineKeyboardButton(
+                        text="Previous",
+                        callback_data=self._callback("subj", "page", page - 1),
+                    )
+                )
+            if page < total_pages - 1:
+                nav_buttons.append(
+                    InlineKeyboardButton(
+                        text="Next",
+                        callback_data=self._callback("subj", "page", page + 1),
+                    )
+                )
+            if nav_buttons:
+                rows.append(nav_buttons)
+
+        action_row: list[InlineKeyboardButton] = [
+            InlineKeyboardButton(
+                text=f"Done ({selected_count})",
+                callback_data=self._callback("subj", "done"),
+            ),
+            InlineKeyboardButton(
+                text="Select all" if selected_count < len(options) else "Clear all",
+                callback_data=self._callback("subj", "all"),
+            ),
+        ]
+        rows.append(action_row)
+        rows.append(self._back_cancel_row())
+
+        markup = InlineKeyboardMarkup(inline_keyboard=rows)
+        await self._upsert_selection_message(chat_id, text, markup, message)
+
+    @staticmethod
+    def _format_erasmus_subject_label(option: ErasmusSubject) -> str:
+        code = (option.subject_code or "").strip()
+        title = option.subject_title.strip() or "Untitled"
+        if code:
+            return f"{code} {title} (C{option.course_id})"
+        return f"{title} (C{option.course_id})"
+
+    async def _toggle_erasmus_subject(
+        self,
+        chat_id: int,
+        subject_id: int,
+        message: Message | None,
+    ) -> None:
+        draft = await self._get_selection_draft(chat_id)
+        if draft is None or not draft.is_erasmus():
+            await self._show_mode_prompt(chat_id, message=message)
+            return
+        if subject_id in draft.selected_subject_ids:
+            draft.selected_subject_ids.discard(subject_id)
+            action_label = "removed"
+        else:
+            draft.selected_subject_ids.add(subject_id)
+            action_label = "added"
+        await self._save_selection_draft(chat_id, draft)
+        LOGGER.info(
+            "Erasmus subject toggled: chat_id=%s subject_id=%s action=%s",
+            chat_id,
+            subject_id,
+            action_label,
+        )
+        await self._show_erasmus_subjects_prompt(chat_id, message=message)
+
+    async def _toggle_all_erasmus_subjects(
+        self,
+        chat_id: int,
+        message: Message | None,
+    ) -> None:
+        draft = await self._get_selection_draft(chat_id)
+        if (
+            draft is None
+            or draft.semester_id is None
+            or draft.program_id is None
+            or not draft.is_erasmus()
+        ):
+            await self._show_mode_prompt(chat_id, message=message)
+            return
+        program_ids = await self._erasmus_program_ids(
+            draft.semester_id,
+            draft.selected_title(),
+            draft.program_id,
+        )
+        options = await self._load_erasmus_subject_options(
+            draft.semester_id,
+            program_ids,
+            draft.program_family,
+        )
+        if not options:
+            await self._show_erasmus_subjects_prompt(chat_id, message=message)
+            return
+        all_ids = {option.subject_id for option in options}
+        if draft.selected_subject_ids >= all_ids:
+            draft.selected_subject_ids = set()
+        else:
+            draft.selected_subject_ids = set(all_ids)
+        await self._save_selection_draft(chat_id, draft)
+        await self._show_erasmus_subjects_prompt(chat_id, message=message)
+
+    async def _resolve_chosen_erasmus_subjects(
+        self,
+        draft: SelectionDraft,
+    ) -> list[ErasmusSubject]:
+        """Return full ErasmusSubject objects for the draft's currently toggled ids."""
+        if draft.semester_id is None or draft.program_id is None:
+            return []
+        program_ids = await self._erasmus_program_ids(
+            draft.semester_id,
+            draft.selected_title(),
+            draft.program_id,
+        )
+        options = await self._load_erasmus_subject_options(
+            draft.semester_id,
+            program_ids,
+            draft.program_family,
+        )
+        options_by_id = {option.subject_id: option for option in options}
+        chosen: list[ErasmusSubject] = []
+        for subject_id in draft.selected_subject_ids:
+            option = options_by_id.get(subject_id)
+            if option is None:
+                continue
+            chosen.append(option)
+        chosen.sort(key=lambda s: (s.course_id, (s.subject_code or "").casefold(), s.subject_title.casefold()))
+        return chosen
+
+    async def _show_erasmus_preview(
+        self,
+        chat_id: int,
+        draft: SelectionDraft,
+        message: Message | None,
+    ) -> None:
+        """Render a preview of the academic-week schedule before final save."""
+        if (
+            draft.semester_id is None
+            or draft.program_id is None
+            or not draft.is_erasmus()
+        ):
+            await self._show_mode_prompt(chat_id, message=message)
+            return
+        if not draft.selected_subject_ids:
+            await self._show_erasmus_subjects_prompt(
+                chat_id,
+                message=message,
+                notice="Pick at least one subject before finishing.",
+            )
+            return
+
+        chosen = await self._resolve_chosen_erasmus_subjects(draft)
+        if not chosen:
+            await self._show_erasmus_subjects_prompt(
+                chat_id,
+                message=message,
+                notice="Your selected subjects are no longer available. Please pick again.",
+            )
+            return
+
+        week_start, week_end = get_academic_week_range(self.settings.zoneinfo)
+        try:
+            events = await asyncio.to_thread(
+                self._collect_erasmus_events,
+                chosen,
+                week_start,
+                week_end,
+            )
+        except RTUAPIError as exc:
+            await self._show_erasmus_subjects_prompt(
+                chat_id,
+                message=message,
+                notice=f"I couldn't load the preview right now: {exc}",
+            )
+            return
+
+        schedule_text = self._render_schedule_message(
+            label="Preview (this week)",
+            start_date=week_start,
+            end_date=week_end,
+            events=events,
+            context_line=f"Erasmus | {len(chosen)} subject(s) selected",
+        )
+
+        intro_lines = [
+            "Preview of your Erasmus schedule for this academic week.",
+            "Tap Confirm to save, Edit subjects to change your picks, or Cancel to discard.",
+            "",
+        ]
+        if not events:
+            intro_lines.extend([
+                "No lessons fall in this week for your selected subjects.",
+                "(That can happen between modules — the schedule will still be saved if you confirm.)",
+                "",
+            ])
+
+        text = "\n".join(intro_lines) + schedule_text
+
+        rows = [
+            [
+                InlineKeyboardButton(
+                    text="Confirm",
+                    callback_data=self._callback("subj", "confirm"),
+                ),
+                InlineKeyboardButton(
+                    text="Edit subjects",
+                    callback_data=self._callback("subj", "edit"),
+                ),
+            ],
+            self._cancel_row(),
+        ]
+        markup = InlineKeyboardMarkup(inline_keyboard=rows)
+        await self._upsert_selection_message(chat_id, text, markup, message)
+
+    async def _save_erasmus_selection(
+        self,
+        chat_id: int,
+        draft: SelectionDraft,
+        message: Message | None,
+    ) -> None:
+        if (
+            draft.semester_id is None
+            or draft.program_id is None
+            or not draft.is_erasmus()
+        ):
+            await self._show_mode_prompt(chat_id, message=message)
+            return
+        if not draft.selected_subject_ids:
+            await self._show_erasmus_subjects_prompt(
+                chat_id,
+                message=message,
+                notice="Pick at least one subject before finishing.",
+            )
+            return
+
+        chosen = await self._resolve_chosen_erasmus_subjects(draft)
+        if not chosen:
+            await self._show_erasmus_subjects_prompt(
+                chat_id,
+                message=message,
+                notice="Your selected subjects are no longer available. Please pick again.",
+            )
+            return
+
+        representative_semester_program_id = chosen[0].semester_program_id
+
+        selection = ChatSelection(
+            chat_id=chat_id,
+            semester_id=draft.semester_id,
+            semester_title=draft.semester_title or self.settings.rtu_semester_title,
+            program_family=draft.program_family,
+            program_id=draft.program_id,
+            program_title=draft.program_title,
+            program_code=draft.program_code,
+            course_id=None,
+            selected_group="Erasmus",
+            semester_program_id=representative_semester_program_id,
+            department_title=draft.department_title or self.settings.rtu_department_title,
+            group_code=STUDY_MODE_ERASMUS,
+            group_name="Erasmus",
+            group_id=None,
+            study_mode=STUDY_MODE_ERASMUS,
+        )
+
+        try:
+            await asyncio.to_thread(self.storage.save_chat_selection, selection)
+            await asyncio.to_thread(self.storage.save_erasmus_subjects, chat_id, chosen)
+        except Exception:
+            LOGGER.exception("Failed to save Erasmus selection: chat_id=%s", chat_id)
+            await self._show_erasmus_subjects_prompt(
+                chat_id,
+                message=message,
+                notice="I couldn't save your selection right now. Please try again.",
+            )
+            return
+
+        await self._clear_selection_draft(chat_id)
+
+        summary_lines = [
+            "Erasmus selection saved.",
+            "",
+            f"Program: {selection.program_title or selection.program_family or 'Unknown'}",
+            f"Subjects selected: {len(chosen)}",
+        ]
+        current_course: int | None = None
+        for subject in chosen:
+            if subject.course_id != current_course:
+                summary_lines.append(f"Course {subject.course_id}:")
+                current_course = subject.course_id
+            label = subject.display_label()
+            summary_lines.append(f"  - {label}")
+
+        if message is not None:
+            await self._upsert_selection_message(
+                chat_id=chat_id,
+                text="\n".join(summary_lines),
+                reply_markup=None,
+                message=message,
+            )
+
+        await self._send_text(
+            chat_id,
+            "The main menu is ready below. Use Change selection whenever you want to switch mode, program, or subjects.",
+            reply_markup=self._main_menu(chat_id),
+        )
+        LOGGER.info(
+            "Erasmus selection completed: chat_id=%s program_id=%s subjects=%s",
+            chat_id,
+            draft.program_id,
+            [s.subject_id for s in chosen],
+        )
 
     async def _complete_selection(
         self,
@@ -2465,6 +3306,10 @@ class ScheduleBotApp:
         include_resolved: bool = False,
     ) -> list[str]:
         lines: list[str] = []
+        if selection.is_erasmus():
+            lines.append("Mode: Erasmus")
+        else:
+            lines.append("Mode: Full Time")
         if selection.semester_title:
             lines.append(f"Study period: {selection.semester_title}")
         elif selection.semester_id is not None:
@@ -2506,6 +3351,10 @@ class ScheduleBotApp:
             f"Study period: {draft.semester_title or self.settings.rtu_semester_title}",
             f"Department: {draft.department_title or self.settings.rtu_department_title}",
         ]
+        if draft.study_mode == STUDY_MODE_ERASMUS:
+            lines.append("Mode: Erasmus")
+        elif draft.study_mode == STUDY_MODE_FULL_TIME:
+            lines.append("Mode: Full Time")
         selected_title = draft.selected_title()
         if selected_title:
             lines.append(f"Program: {selected_title}")
