@@ -10,7 +10,11 @@ from collections.abc import Awaitable, Callable
 from datetime import date, datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramRetryAfter,
+)
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     BotCommand,
@@ -72,6 +76,8 @@ BUTTON_REFRESH = "Refresh"
 BUTTON_STATUS = "Status"
 BUTTON_CHANGE_SELECTION = "Change selection"
 BUTTON_STATS = "Stats"
+BUTTON_ADMIN = "Admin"
+BROADCAST_INTER_SEND_DELAY_SECONDS = 0.05
 
 CALLBACK_PREFIX = "cfg"
 WEEKEND_MESSAGE = "That was the last lesson for this week. Have a great weekend!"
@@ -101,6 +107,10 @@ class ScheduleBotApp:
         self.dispatcher.include_router(self.router)
         self._selection_drafts: dict[int, SelectionDraft] = {}
         self._erasmus_subject_cache: dict[tuple[int, tuple[int, ...]], list[ErasmusSubject]] = {}
+        # Admin chats waiting to type a broadcast message after tapping "Send Message"
+        self._broadcast_awaiting: set[int] = set()
+        # Admin chats with a drafted broadcast pending confirmation
+        self._broadcast_drafts: dict[int, str] = {}
         self._register_handlers()
 
     async def start_polling(self) -> None:
@@ -404,10 +414,15 @@ class ScheduleBotApp:
         self.router.message.register(self.btn_status, F.text == BUTTON_STATUS)
         self.router.message.register(self.btn_change_selection, F.text == BUTTON_CHANGE_SELECTION)
         self.router.message.register(self.btn_stats, F.text == BUTTON_STATS)
+        self.router.message.register(self.btn_admin, F.text == BUTTON_ADMIN)
         self.router.callback_query.register(
             self.handle_configuration_callback,
             F.data.startswith(f"{CALLBACK_PREFIX}:"),
         )
+        # Catch-all text handler: only acts when an admin chat is awaiting a
+        # broadcast draft. Registered LAST so it never intercepts commands or
+        # known reply-keyboard buttons.
+        self.router.message.register(self.handle_admin_broadcast_text, F.text)
 
     async def cmd_start(self, message: Message) -> None:
         await self._run_action(
@@ -562,6 +577,34 @@ class ScheduleBotApp:
             fallback_message="I couldn't load the bot statistics right now. Please try again.",
         )
 
+    async def btn_admin(self, message: Message) -> None:
+        await self._run_action(
+            chat_id=message.chat.id,
+            action="admin",
+            source="button",
+            callback=lambda: self._show_admin_menu(message.chat.id),
+            fallback_message="I couldn't open the admin menu right now. Please try again.",
+        )
+
+    async def handle_admin_broadcast_text(self, message: Message) -> None:
+        """Capture an admin's broadcast draft text when the chat is in awaiting state."""
+        if message.text is None:
+            return
+        chat_id = message.chat.id
+        if not self.settings.is_admin_chat(chat_id):
+            return
+        if chat_id not in self._broadcast_awaiting:
+            return
+        self._broadcast_awaiting.discard(chat_id)
+        self._broadcast_drafts[chat_id] = message.text
+        await asyncio.to_thread(self.storage.touch_chat_activity, chat_id, False)
+        LOGGER.info(
+            "Admin broadcast draft captured: chat_id=%s length=%s",
+            chat_id,
+            len(message.text),
+        )
+        await self._show_broadcast_preview(chat_id)
+
     async def handle_configuration_callback(self, callback: CallbackQuery) -> None:
         data = callback.data or ""
         parts = data.split(":")
@@ -595,6 +638,10 @@ class ScheduleBotApp:
                     await self._cancel_configuration(chat_id, message)
                     return
                 await callback.answer()
+                return
+
+            if action == "admin":
+                await self._handle_admin_callback(chat_id, mode, callback, message)
                 return
 
             if action in {"period", "dept"}:
@@ -1100,6 +1147,202 @@ class ScheduleBotApp:
             ),
             reply_markup=self._main_menu(chat_id),
         )
+
+    async def _show_admin_menu(self, chat_id: int) -> None:
+        if not self.settings.is_admin_chat(chat_id):
+            LOGGER.info("Admin menu access denied for chat_id=%s", chat_id)
+            await self._send_text(chat_id, "Access denied.")
+            return
+        # Tapping Admin elsewhere cancels any in-flight broadcast draft.
+        self._broadcast_awaiting.discard(chat_id)
+        self._broadcast_drafts.pop(chat_id, None)
+        markup = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Stats",
+                        callback_data=self._callback("admin", "stats"),
+                    ),
+                    InlineKeyboardButton(
+                        text="Send message",
+                        callback_data=self._callback("admin", "send"),
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="Close",
+                        callback_data=self._callback("admin", "close"),
+                    ),
+                ],
+            ]
+        )
+        await self._send_text(
+            chat_id,
+            "Admin menu. Pick an action.",
+            reply_markup=markup,
+        )
+
+    async def _prompt_admin_broadcast_text(
+        self,
+        chat_id: int,
+        message: Message | None,
+    ) -> None:
+        self._broadcast_drafts.pop(chat_id, None)
+        self._broadcast_awaiting.add(chat_id)
+        text = (
+            "Send me the message you want to broadcast to every chat.\n"
+            "Plain text only. Tap Cancel to abort."
+        )
+        markup = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Cancel",
+                        callback_data=self._callback("admin", "cancel"),
+                    )
+                ]
+            ]
+        )
+        if message is not None:
+            try:
+                await message.edit_text(text, reply_markup=markup)
+                return
+            except TelegramBadRequest:
+                pass
+        await self._send_text(chat_id, text, reply_markup=markup)
+
+    async def _show_broadcast_preview(self, chat_id: int) -> None:
+        draft = self._broadcast_drafts.get(chat_id)
+        if draft is None:
+            await self._show_admin_menu(chat_id)
+            return
+        recipients = await asyncio.to_thread(self.storage.get_all_chat_ids)
+        recipient_count = len(recipients)
+        text = (
+            "Broadcast preview\n"
+            f"Recipients: {recipient_count} chat(s)\n"
+            "--------\n"
+            f"{draft}\n"
+            "--------\n"
+            "Tap Confirm to send, or Cancel to discard."
+        )
+        markup = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Confirm broadcast",
+                        callback_data=self._callback("admin", "confirm"),
+                    ),
+                    InlineKeyboardButton(
+                        text="Cancel",
+                        callback_data=self._callback("admin", "cancel"),
+                    ),
+                ]
+            ]
+        )
+        await self._send_text(chat_id, text, reply_markup=markup)
+
+    async def _broadcast_to_all(self, admin_chat_id: int) -> None:
+        draft = self._broadcast_drafts.pop(admin_chat_id, None)
+        if draft is None:
+            await self._send_text(
+                admin_chat_id,
+                "No broadcast is pending. Tap Send message to start over.",
+                reply_markup=self._main_menu(admin_chat_id),
+            )
+            return
+        recipients = await asyncio.to_thread(self.storage.get_all_chat_ids)
+        sent = 0
+        blocked = 0
+        failed = 0
+        LOGGER.info(
+            "Broadcast starting: admin_chat_id=%s recipients=%s length=%s",
+            admin_chat_id,
+            len(recipients),
+            len(draft),
+        )
+        for target in recipients:
+            try:
+                await self.bot.send_message(target, draft)
+                sent += 1
+            except TelegramForbiddenError:
+                blocked += 1
+            except TelegramRetryAfter as exc:
+                await asyncio.sleep(exc.retry_after)
+                try:
+                    await self.bot.send_message(target, draft)
+                    sent += 1
+                except Exception:
+                    LOGGER.exception(
+                        "Broadcast retry failed: admin_chat_id=%s target=%s",
+                        admin_chat_id,
+                        target,
+                    )
+                    failed += 1
+            except Exception:
+                LOGGER.exception(
+                    "Broadcast send failed: admin_chat_id=%s target=%s",
+                    admin_chat_id,
+                    target,
+                )
+                failed += 1
+            await asyncio.sleep(BROADCAST_INTER_SEND_DELAY_SECONDS)
+        LOGGER.info(
+            "Broadcast done: admin_chat_id=%s sent=%s blocked=%s failed=%s",
+            admin_chat_id,
+            sent,
+            blocked,
+            failed,
+        )
+        summary = (
+            "Broadcast complete.\n"
+            f"Sent: {sent}\n"
+            f"Blocked (user blocked bot): {blocked}\n"
+            f"Failed: {failed}"
+        )
+        await self._send_text(admin_chat_id, summary, reply_markup=self._main_menu(admin_chat_id))
+
+    async def _handle_admin_callback(
+        self,
+        chat_id: int,
+        mode: str,
+        callback: CallbackQuery,
+        message: Message | None,
+    ) -> None:
+        if not self.settings.is_admin_chat(chat_id):
+            await callback.answer("Access denied.", show_alert=True)
+            return
+        if mode == "stats":
+            await callback.answer()
+            await self._show_stats(chat_id)
+            return
+        if mode == "send":
+            await callback.answer()
+            await self._prompt_admin_broadcast_text(chat_id, message)
+            return
+        if mode == "confirm":
+            await callback.answer("Sending…")
+            await self._broadcast_to_all(chat_id)
+            return
+        if mode == "cancel":
+            self._broadcast_awaiting.discard(chat_id)
+            self._broadcast_drafts.pop(chat_id, None)
+            await callback.answer("Cancelled.")
+            await self._send_text(
+                chat_id,
+                "Broadcast cancelled.",
+                reply_markup=self._main_menu(chat_id),
+            )
+            return
+        if mode == "close":
+            await callback.answer()
+            if message is not None:
+                try:
+                    await message.delete()
+                except TelegramBadRequest:
+                    pass
+            return
+        await callback.answer()
 
     async def _send_schedule_for_predefined_range(
         self,
@@ -1720,7 +1963,7 @@ class ScheduleBotApp:
         ]
         final_row = [KeyboardButton(text=BUTTON_CHANGE_SELECTION)]
         if chat_id is not None and self.settings.is_admin_chat(chat_id):
-            final_row.append(KeyboardButton(text=BUTTON_STATS))
+            final_row.append(KeyboardButton(text=BUTTON_ADMIN))
         keyboard.append(final_row)
         return ReplyKeyboardMarkup(
             keyboard=keyboard,

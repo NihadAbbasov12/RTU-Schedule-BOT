@@ -3,7 +3,8 @@
     "allow": [
       "Bash(.venv/Scripts/python.exe smoke_test.py)",
       "Bash(.venv/Scripts/python.exe app.py)",
-      "Bash(.venv/Scripts/python.exe probe_erasmus.py)"
+      "Bash(.venv/Scripts/python.exe probe_erasmus.py)",
+      "Bash(.venv/Scripts/python.exe -c \"import bot; print\\('import OK'\\); print\\('BUTTON_ADMIN=', bot.BUTTON_ADMIN\\)\")"
     ]
   }
 }

@@ -899,6 +899,14 @@ class SnapshotStorage:
             schedule_request,
         )
 
+    def get_all_chat_ids(self) -> list[int]:
+        """Return every chat_id that has ever interacted with the bot."""
+        with self._lock:
+            rows = self.connection.execute(
+                "SELECT chat_id FROM chat_activity ORDER BY chat_id"
+            ).fetchall()
+        return [int(row["chat_id"]) for row in rows]
+
     def get_chat_selection(self, chat_id: int) -> ChatSelection | None:
         """Load the current RTU study selection for a chat."""
         with self._lock:
