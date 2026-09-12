@@ -1,0 +1,5 @@
+# These files are executed on the Linux server. With core.autocrlf=true a
+# Windows checkout would give them CRLF endings, and bash then fails on the
+# shebang with "$'\r': command not found".
+*.sh text eol=lf
+*.service text eol=lf
