@@ -1,0 +1,63 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      # Without this the first push after adding the workflow fails at ssh-keyscan
+      # with an empty host, which reads like a broken deployment rather than an
+      # unconfigured one.
+      - name: Check that the deployment secrets are set
+        id: secrets
+        run: |
+          if [ -z "${{ secrets.DEPLOY_HOST }}" ] || [ -z "${{ secrets.DEPLOY_USER }}" ] || [ -z "${{ secrets.DEPLOY_SSH_KEY }}" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::DEPLOY_HOST, DEPLOY_USER or DEPLOY_SSH_KEY is missing - skipping the deployment."
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up the deploy key
+        if: steps.secrets.outputs.configured == 'true'
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Sync the code to the server
+        if: steps.secrets.outputs.configured == 'true'
+        run: |
+          rsync -az --delete \
+            -e "ssh -i ~/.ssh/id_deploy -o StrictHostKeyChecking=yes" \
+            --exclude '.git' \
+            --exclude '.github' \
+            --exclude '.claude' \
+            --exclude '.venv' \
+            --exclude '.env' \
+            --exclude '*.db' \
+            --exclude '__pycache__' \
+            ./ "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:/opt/rtu-schedule-bot/"
+
+      - name: Install dependencies and restart the bot
+        if: steps.secrets.outputs.configured == 'true'
+        run: |
+          ssh -i ~/.ssh/id_deploy -o StrictHostKeyChecking=yes \
+            "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" \
+            'bash /opt/rtu-schedule-bot/deploy/deploy.sh'
+
+      - name: Remove the deploy key
+        if: always()
+        run: rm -f ~/.ssh/id_deploy

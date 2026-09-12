@@ -1,0 +1,31 @@
+[Unit]
+Description=RTU Schedule Telegram Bot
+Documentation=https://github.com/NihadAbbasov12/RTU-Schedule-BOT
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deploy
+Group=deploy
+WorkingDirectory=/opt/rtu-schedule-bot
+# config.py calls load_dotenv(), which reads /opt/rtu-schedule-bot/.env
+ExecStart=/opt/rtu-schedule-bot/.venv/bin/python -u app.py
+Restart=always
+RestartSec=5
+# Telegram long polling plus the RTU API: give the process room to retry on its own
+TimeoutStopSec=20
+KillSignal=SIGINT
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/opt/rtu-schedule-bot
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rtu-schedule-bot
+
+[Install]
+WantedBy=multi-user.target

@@ -214,6 +214,67 @@ The bot stores:
 - `rtu_api.py` - RTU API client, exact program listing, legacy family grouping, course and group resolution
 - `scheduler.py` - APScheduler integration
 - `storage.py` - SQLite storage for chat selections, reminders, stats, snapshots, and weekend notifications
+- `smoke_test.py` - offline end-to-end test with a mocked RTU API and a throwaway database
+- `live_check.py` - end-to-end check against the real RTU API and the real database
+- `deploy/` - systemd unit and the server-side setup and deploy scripts
+- `.github/workflows/deploy.yml` - rsync + restart deployment on every push to `main`
+
+## Deployment
+
+The bot runs as a systemd service on a plain Ubuntu server. Code is delivered by
+`rsync` from GitHub Actions, which then restarts the service.
+
+Layout on the server:
+
+- `/opt/rtu-schedule-bot` - application directory, owned by the `deploy` user
+- `/opt/rtu-schedule-bot/.env` - secrets, created once by hand, never synced
+- `/opt/rtu-schedule-bot/rtu_schedule.db` - SQLite database, never synced
+- `/etc/systemd/system/rtu-schedule-bot.service` - the unit
+
+### One-time server setup
+
+```bash
+sudo apt-get update && sudo apt-get install -y git rsync
+sudo git clone https://github.com/NihadAbbasov12/RTU-Schedule-BOT.git /tmp/rtu-bot
+sudo bash /tmp/rtu-bot/deploy/server-setup.sh
+```
+
+`server-setup.sh` installs Python and rsync, creates the `deploy` user and
+`/opt/rtu-schedule-bot`, allows that user to restart the service without a
+password, and installs plus enables the systemd unit. It is idempotent and never
+touches `.env` or the database.
+
+Then add the deploy public key and the environment file:
+
+```bash
+echo "<github actions public key>" | sudo tee -a /home/deploy/.ssh/authorized_keys
+sudo -u deploy nano /opt/rtu-schedule-bot/.env      # see "Example .env" above
+sudo chmod 600 /opt/rtu-schedule-bot/.env
+```
+
+### GitHub Actions secrets
+
+| Secret | Value |
+| --- | --- |
+| `DEPLOY_HOST` | server IP or hostname |
+| `DEPLOY_USER` | `deploy` |
+| `DEPLOY_SSH_KEY` | the **private** key whose public half is in `authorized_keys` |
+
+### Deploying
+
+Push to `main`, or run the `Deploy` workflow manually. The workflow syncs the
+repository (excluding `.env`, `*.db`, `.venv`, `__pycache__`) and then runs
+`deploy/deploy.sh` on the server, which installs dependencies, byte-compiles the
+sources, restarts the unit, and fails the build if the service is not still
+running five seconds later.
+
+Useful commands on the server:
+
+```bash
+sudo systemctl status rtu-schedule-bot
+sudo journalctl -u rtu-schedule-bot -f
+sudo systemctl restart rtu-schedule-bot
+```
 
 ## Notes
 
