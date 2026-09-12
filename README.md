@@ -4,7 +4,7 @@ Python 3.11 Telegram bot for the public RTU lesson schedule site at `https://nod
 
 The bot is locked to the current Foreign Students setup and uses a simplified onboarding flow:
 
-- Study period: `2025/2026 Spring semester (25/26-SP)`
+- Study period: `2026/2027 Autumn semester (26/27-A)`
 - Department: `Foreign Students Department (02A00)`
 - User choice: `program title -> exact RTU program code -> course -> group code`
 
@@ -24,7 +24,7 @@ The bot is locked to the current Foreign Students setup and uses a simplified on
 
 When a user opens the bot and presses `/start`, the bot automatically uses:
 
-- `2025/2026 Spring semester (25/26-SP)`
+- `2026/2027 Autumn semester (26/27-A)`
 - `Foreign Students Department (02A00)`
 
 Then it shows unique program-title buttons without RTU codes, for example:
@@ -161,8 +161,8 @@ TELEGRAM_CHAT_ID=
 ADMIN_CHAT_IDS=
 RTU_BASE_URL=https://nodarbibas.rtu.lv
 RTU_LANG=en
-RTU_SEMESTER_ID=29
-RTU_SEMESTER_TITLE=2025/2026 Spring semester (25/26-SP)
+RTU_SEMESTER_ID=31
+RTU_SEMESTER_TITLE=2026/2027 Autumn semester (26/27-A)
 RTU_DEPARTMENT_CODE=02A00
 RTU_DEPARTMENT_TITLE=Foreign Students Department (02A00)
 ENABLE_SCHEDULER=true

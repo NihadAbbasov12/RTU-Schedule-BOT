@@ -177,6 +177,14 @@ class ScheduleBotApp:
                     selection.chat_id,
                 )
                 continue
+            if not self._selection_uses_current_semester(selection):
+                LOGGER.warning(
+                    "Skipping chat %s during weekend check: selection belongs to semester_id=%s but the bot now uses semester_id=%s",
+                    selection.chat_id,
+                    selection.semester_id,
+                    self.settings.rtu_semester_id,
+                )
+                continue
             if not self._selection_has_resolvable_target(selection):
                 LOGGER.warning(
                     "Skipping chat %s during weekend check: selection is incomplete or missing group_code course_id=%s saved_group_code=%s saved_group=%s",
@@ -302,6 +310,14 @@ class ScheduleBotApp:
                 LOGGER.info(
                     "Skipping Erasmus chat %s during reminder scan (reminders not implemented for Erasmus yet)",
                     selection.chat_id,
+                )
+                continue
+            if not self._selection_uses_current_semester(selection):
+                LOGGER.warning(
+                    "Skipping chat %s during reminder scan: selection belongs to semester_id=%s but the bot now uses semester_id=%s",
+                    selection.chat_id,
+                    selection.semester_id,
+                    self.settings.rtu_semester_id,
                 )
                 continue
             if not self._selection_has_resolvable_target(selection):
@@ -913,6 +929,23 @@ class ScheduleBotApp:
                 "Choose your study mode, program, and subjects first to continue.",
             )
             return
+        if not self._selection_uses_current_semester(selection):
+            LOGGER.info(
+                "Erasmus selection for chat %s belongs to semester_id=%s but the bot now uses semester_id=%s",
+                chat_id,
+                selection.semester_id,
+                self.settings.rtu_semester_id,
+            )
+            await self._prompt_for_selection(
+                chat_id,
+                (
+                    "This bot now uses only the current Foreign Students setup.\n\n"
+                    f"Study period: {self.settings.rtu_semester_title}\n"
+                    f"Department: {self.settings.rtu_department_title}\n\n"
+                    "Choose your study program and subjects again."
+                ),
+            )
+            return
         subjects = await asyncio.to_thread(self.storage.get_erasmus_subjects, chat_id)
         if not subjects:
             await self._send_text(
@@ -1424,6 +1457,10 @@ class ScheduleBotApp:
             reply_markup=self._main_menu(chat_id),
         )
 
+    def _selection_uses_current_semester(self, selection: ChatSelection) -> bool:
+        """Return whether a saved selection belongs to the semester the bot is locked to."""
+        return selection.semester_id == self.settings.rtu_semester_id
+
     @staticmethod
     def _selection_has_resolvable_target(selection: ChatSelection) -> bool:
         return (
@@ -1663,6 +1700,14 @@ class ScheduleBotApp:
                     action,
                 )
                 continue
+            if not self._selection_uses_current_semester(selection):
+                LOGGER.warning(
+                    "Skipping chat %s during scheduled broadcast: selection belongs to semester_id=%s but the bot now uses semester_id=%s",
+                    selection.chat_id,
+                    selection.semester_id,
+                    self.settings.rtu_semester_id,
+                )
+                continue
             if not self._selection_has_resolvable_target(selection):
                 LOGGER.warning(
                     "Skipping chat %s for scheduled action %s: selection is incomplete or missing group_code course_id=%s saved_group_code=%s saved_group=%s",
@@ -1747,6 +1792,8 @@ class ScheduleBotApp:
 
         for selection in selections:
             if not self._selection_has_resolvable_target(selection):
+                continue
+            if not self._selection_uses_current_semester(selection):
                 continue
 
             selection_key = selection.selection_key()

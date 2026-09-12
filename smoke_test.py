@@ -35,7 +35,7 @@ from storage import SnapshotStorage
 from bot import ScheduleBotApp
 
 
-SEMESTER_ID = 29
+SEMESTER_ID = 31
 PROGRAM_ID = 1128
 PROGRAM_TITLE = "Computer Systems"
 PROGRAM_CODE = "RDBC0"
@@ -141,8 +141,8 @@ class FakeRTUClient:
     def get_locked_study_period(self) -> StudyPeriod:
         return StudyPeriod(
             semester_id=SEMESTER_ID,
-            title="2025/2026 Spring semester (25/26-SP)",
-            short_name="25/26-SP",
+            title="2026/2027 Autumn semester (26/27-A)",
+            short_name="26/27-A",
             active=True,
         )
 

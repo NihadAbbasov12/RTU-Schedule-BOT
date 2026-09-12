@@ -61,8 +61,8 @@ class Settings:
     rtu_base_url: str = "https://nodarbibas.rtu.lv"
     rtu_lang: str = "en"
     # The bot is locked to the active Foreign Students semester/department.
-    rtu_semester_id: int = 29
-    rtu_semester_title: str = "2025/2026 Spring semester (25/26-SP)"
+    rtu_semester_id: int = 31
+    rtu_semester_title: str = "2026/2027 Autumn semester (26/27-A)"
     rtu_department_code: str = "02A00"
     rtu_department_title: str = "Foreign Students Department (02A00)"
     rtu_program_id: int = 1128
@@ -109,10 +109,10 @@ class Settings:
             telegram_chat_id=chat_id,
             rtu_base_url=os.getenv("RTU_BASE_URL", "https://nodarbibas.rtu.lv").rstrip("/"),
             rtu_lang=os.getenv("RTU_LANG", "en").strip() or "en",
-            rtu_semester_id=_parse_int(os.getenv("RTU_SEMESTER_ID"), 29) or 29,
+            rtu_semester_id=_parse_int(os.getenv("RTU_SEMESTER_ID"), 31) or 31,
             rtu_semester_title=(
-                os.getenv("RTU_SEMESTER_TITLE", "2025/2026 Spring semester (25/26-SP)").strip()
-                or "2025/2026 Spring semester (25/26-SP)"
+                os.getenv("RTU_SEMESTER_TITLE", "2026/2027 Autumn semester (26/27-A)").strip()
+                or "2026/2027 Autumn semester (26/27-A)"
             ),
             rtu_department_code=(
                 os.getenv("RTU_DEPARTMENT_CODE", "02A00").strip() or "02A00"
